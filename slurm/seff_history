@@ -1,0 +1,511 @@
+#!/n/sw/envs/seff-array/bin/python3
+#
+# seff_history (based on /usr/local/bin/seff-account, fasrc/seff-account).
+# Summarizes job efficiency for a user or account over a window and shows histograms.
+#
+# Fixes vs the system copy:
+#   - No more shell=True / f-string command injection: sacct is run from an argv list.
+#   - Requires exactly one of -u/-A (system copy crashed when neither was given).
+#   - -c/--cluster now actually defaults to $SLURM_CLUSTER_NAME.
+#   - `except: exit` (a no-op) replaced with `continue` in the GPU helpers.
+#   - sacct failures reported cleanly; robust memory parsing.
+# Presentation:
+#   - Compact header + one-line job-state and requested-resource summaries.
+#   - One efficiency block: simple-mean | resource-weighted | inline weighted bar
+#     (replaces the old stats lines + two redundant bar charts).
+#   - Resource-weighted = total used / total allocated resource-hours (big jobs
+#     count more than tiny ones).
+#   - "Most wasteful jobs" table (top jobs by idle GPU-hours / core-hours).
+#   - The four efficiency-distribution histograms are kept below.
+
+import argparse
+import subprocess
+import sys
+import re
+
+import numpy as np
+import pandas as pd
+
+from io import StringIO
+import os
+import getpass
+
+import termplotlib as tpl
+
+import json
+import gzip
+import base64
+from typing import Optional
+
+__version__ = 0.3
+debug = False
+
+MAX_WASTE = 10   # rows in the "most wasteful jobs" table
+BAR_WIDTH = 40   # chars for a 100% bar
+PARK_MEM = 0.50      # GPU-memory fraction above which a job is "holding" GPU memory
+PARK_COMPUTE = 0.10  # GPU-compute fraction below which the GPU is effectively idle
+GPU_MEM_NOTE = ("  NOTE: very approximate -- GPU memory here is PEAK usage (high-water mark),"
+                " not actual/time-averaged usage, and compute is a duty-cycle %")
+
+# JobName patterns treated as interactive for --no-interactive. salloc / srun --pty
+# default to "interactive" on FASRC (covers =interactive, g-interactive too); OnDemand
+# apps use jupyter / sys/... names; bare shells are interactive sessions.
+INTERACTIVE_PAT = r'interactive|jupyter|ondemand|spawner|^sys/|^(?:bash|sh|zsh|tcsh)$'
+
+
+def time_to_float(time):
+    """ converts [dd-[hh:]]mm:ss time to seconds """
+    if isinstance(time, float):
+        return time
+    days, hours = 0, 0
+
+    if "-" in time:
+        days = int(time.split("-")[0]) * 86400
+        time = time.split("-")[1]
+    time = time.split(":")
+
+    if len(time) > 2:
+        hours = int(time[0]) * 3600
+
+    mins = int(time[-2]) * 60
+    secs = float(time[-1])
+
+    return days + hours + mins + secs
+
+
+def human_time(seconds):
+    """seconds -> d-hh:mm:ss (or hh:mm:ss when under a day)."""
+    seconds = int(round(float(seconds)))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    return f"{d}-{h:02d}:{m:02d}:{s:02d}" if d else f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def bar(pct, width=BAR_WIDTH):
+    """Unicode block bar for a 0..100 percentage (width chars == 100%)."""
+    pct = max(0.0, min(100.0, float(pct)))
+    eighths = int(round(pct / 100.0 * width * 8))
+    full, rem = divmod(eighths, 8)
+    s = '█' * full
+    if rem:
+        s += ' ▏▎▍▌▋▊▉'[rem]
+    return s
+
+
+def mem_to_gb(x):
+    """Parse a sacct memory value to GB (handles a K/M/G/T/P suffix and the fillna float)."""
+    s = str(x).strip()
+    m = re.match(r'([0-9.]+)\s*([KMGTP]?)', s)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    factor = {'': 1.0, 'K': 1 / 1024 / 1024, 'M': 1 / 1024, 'G': 1.0, 'T': 1024.0, 'P': 1024.0 * 1024}
+    return val * factor.get(m.group(2), 1.0)
+
+
+def get_stats_dict(ss64: Optional[str]) -> dict:
+    """Convert the base64-encoded summary statistics to JSON."""
+    if (not ss64) or pd.isna(ss64) or ss64 == "JS1:Short" or ss64 == "JS1:None":
+        return {}
+    try:
+        return json.loads(gzip.decompress(base64.b64decode(ss64[4:])))
+    except Exception:
+        return {}
+
+
+def gpu_count(js):
+    gpu_cnt = 0
+    if js:
+        for node in js['nodes']:
+            try:
+                gpus = list(js['nodes'][node]['gpu_utilization'].keys())
+            except Exception:
+                continue
+            for gpu in gpus:
+                gpu_cnt += 1
+    return gpu_cnt
+
+
+def gpu_from_tres(s):
+    """Number of GPUs from a sacct AllocTRES string (gres/gpu=N), reliably present
+    for any GPU job even when the jobstats AdminComment blob is missing."""
+    m = re.search(r'gres/gpu=(\d+)', str(s))
+    return int(m.group(1)) if m else 0
+
+
+def gpu_util(js):
+    gpu_util = 0
+    if js:
+        for node in js['nodes']:
+            try:
+                gpus = list(js['nodes'][node]['gpu_utilization'].keys())
+            except Exception:
+                continue
+            for gpu in gpus:
+                gpu_util += js['nodes'][node]['gpu_utilization'][gpu] / 100.0
+    return gpu_util
+
+
+def gpu_mem_use(js):
+    """Sum of per-GPU peak memory fractions (gpu_used_memory / gpu_total_memory),
+    parallel to gpu_util; divided by the GPU count this gives mean GPU-mem usage."""
+    total = 0.0
+    if js:
+        for node in js.get('nodes', {}).values():
+            used = node.get('gpu_used_memory', {})
+            tot = node.get('gpu_total_memory', {})
+            for g, cap in tot.items():
+                if cap:
+                    total += used.get(g, 0) / cap
+    return total
+
+
+def sacct_df(base, extra):
+    """Run `sacct base+extra` (argv list, no shell) and return a DataFrame."""
+    try:
+        out = subprocess.check_output(base + extra, universal_newlines=True,
+                                      stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        sys.exit("ERROR: sacct not found in PATH")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"ERROR: sacct failed: {(e.stderr or '').strip()}")
+    return pd.read_csv(StringIO(out), sep='|')
+
+
+def safediv(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return np.divide(a, b, out=np.zeros_like(a), where=b != 0)
+
+
+def job_eff(user, account, starttime, endtime, cluster, no_interactive=False, view='full'):
+
+    sel = ['-a', '-A', account] if account is not None else ['-u', user]
+    if cluster:
+        sel += ['--cluster', cluster]
+    window = ['-S', starttime, '-E', endtime]
+    base = ['sacct', '--units=G', '-P', '--state=CA,CD,F,OOM,TO'] + window + sel
+
+    short_fmt = '--format=JobID,JobName,Elapsed,ReqMem,ReqCPUS,Timelimit,State,TotalCPU,NNodes,User,Account,Cluster,AllocTRES,AdminComment'
+    long_fmt  = '--format=JobID,JobName,Elapsed,ReqMem,ReqCPUS,Timelimit,State,TotalCPU,NNodes,User,Account,Cluster,MaxRSS,AdminComment'
+    df_short = sacct_df(base, ['-X', short_fmt])   # one row per job (allocations)
+    df_long  = sacct_df(base, [long_fmt])          # includes steps (carry MaxRSS)
+
+    if len(df_long) == 0 or len(df_short) == 0:
+        print("No jobs have completed.")
+        return -1
+
+    # cleaning
+    df_short = df_short.fillna(0.)
+    df_long  = df_long.fillna(0.)
+    df_long['Timelimit'] = df_long.Timelimit.replace('UNLIMITED', '365-00:00:00').replace('Partition_Limit', '365-00:00:00')
+    df_long['JobID'] = df_long.JobID.map(lambda x: str(x).split('.')[0])
+    df_long['MaxRSS'] = df_long.MaxRSS.map(mem_to_gb)
+    df_long['ReqMem'] = df_long.ReqMem.map(mem_to_gb)
+    df_long['TotalCPU'] = df_long.TotalCPU.map(time_to_float)
+    df_long['Elapsed'] = df_long.Elapsed.map(time_to_float)
+    df_long['Timelimit'] = df_long.Timelimit.map(time_to_float)
+    df_short['AdminComment'] = df_short.AdminComment.map(get_stats_dict)
+
+    # optionally drop interactive jobs from both frames. Union of two signals:
+    #   (a) JobName matches INTERACTIVE_PAT (salloc default "interactive", OnDemand, shells)
+    #   (b) the job has a .interactive step (salloc / srun --pty) -- needs a separate
+    #       sacct query, since the --state-filtered query above omits step rows.
+    n_interactive = 0
+    if no_interactive:
+        name_ids = set(df_short.loc[
+            df_short['JobName'].astype(str).str.contains(INTERACTIVE_PAT, case=False, regex=True, na=False),
+            'JobID'].astype(str))
+        step_raw = sacct_df(['sacct', '-P'] + window + sel, ['-o', 'JobID'])['JobID'].astype(str)
+        step_ids = set(step_raw[step_raw.str.contains(r'\.interactive', na=False)].str.split('.').str[0])
+        inter_ids = name_ids | step_ids
+        before = len(df_short)
+        df_short = df_short[~df_short['JobID'].astype(str).isin(inter_ids)]
+        df_long  = df_long[~df_long['JobID'].astype(str).isin(inter_ids)]
+        n_interactive = before - len(df_short)
+        if len(df_short) == 0 or len(df_long) == 0:
+            print("No non-interactive jobs found in this window.")
+            return -1
+
+    # one clean per-job table (indexed by JobID): long side collapsed to per-job,
+    # short side supplies GPU info and the real job name; merged by JobID.
+    g = df_long.groupby('JobID')
+    job = pd.DataFrame({
+        'cpu_use':  g['TotalCPU'].max(),
+        'cpu_req':  g['ReqCPUS'].max(),
+        'nodes':    g['NNodes'].max(),
+        'time_use': g['Elapsed'].max(),
+        'time_req': g['Timelimit'].max(),
+        'mem_use':  g['MaxRSS'].max(),
+        'mem_req':  g['ReqMem'].max(),
+    })
+    si = df_short.set_index('JobID')
+    job['name']    = si['JobName'].reindex(job.index).astype(str)
+    # GPU COUNT from AllocTRES (reliable); GPU UTILIZATION from the jobstats blob
+    # (only some jobs have it). gpu_nblob = #GPUs the blob reported = "has util data".
+    job['gpu_req']   = si['AllocTRES'].map(gpu_from_tres).reindex(job.index).fillna(0).astype(float)
+    job['gpu_use']   = si['AdminComment'].map(gpu_util).reindex(job.index).fillna(0).astype(float)
+    job['gpu_mem']   = si['AdminComment'].map(gpu_mem_use).reindex(job.index).fillna(0).astype(float)
+    job['gpu_nblob'] = si['AdminComment'].map(gpu_count).reindex(job.index).fillna(0).astype(float)
+
+    cu, cr = job.cpu_use.to_numpy(float), job.cpu_req.to_numpy(float)
+    tu, tr = job.time_use.to_numpy(float), job.time_req.to_numpy(float)
+    mu, mr = job.mem_use.to_numpy(float), job.mem_req.to_numpy(float)
+    gu, gr = job.gpu_use.to_numpy(float), job.gpu_req.to_numpy(float)
+    gm = job.gpu_mem.to_numpy(float)
+    gnb = job.gpu_nblob.to_numpy(float)
+    gpu_mask = gr > 0                  # GPU jobs (from AllocTRES) -- reliable
+    util_mask = (gr > 0) & (gnb > 0)   # GPU jobs that also have jobstats utilization
+
+    cpu_eff  = (safediv(cu, tu) / np.where(cr != 0, cr, 1)).clip(0, 1)
+    mem_eff  = safediv(mu, mr).clip(0, 1)
+    time_eff = safediv(tu, tr).clip(0, 1)
+    gpu_eff_all = safediv(gu, gr).clip(0, 1)
+    gpu_eff = gpu_eff_all[util_mask]   # efficiency only where utilization is known
+    gpu_mem_eff_all = safediv(gm, gr).clip(0, 1)
+    gpu_mem_eff = gpu_mem_eff_all[util_mask]
+
+    job['idle_core_h'] = np.maximum(cr * tu - cu, 0.0) / 3600.0
+    idle_gpu = np.maximum((gr - gu) * tu, 0.0) / 3600.0
+    idle_gpu[~util_mask] = 0.0          # unknown utilization -> don't claim idle GPU-hours
+    job['idle_gpu_h'] = idle_gpu
+    job['cpu_eff'], job['gpu_eff'], job['mem_eff'], job['gpu_mem_eff'] = cpu_eff, gpu_eff_all, mem_eff, gpu_mem_eff_all
+
+    def wdiv(num, den):
+        den = den.sum()
+        return float(np.clip(num.sum() / den, 0, 1)) if den > 0 else 0.0
+    cpu_w  = wdiv(cu, cr * tu)
+    mem_w  = wdiv(mu * tu, mr * tu)
+    time_w = wdiv(tu, tr)
+    gpu_w  = wdiv(gu[util_mask] * tu[util_mask], gr[util_mask] * tu[util_mask])
+    gpu_mem_w = wdiv(gm[util_mask] * tu[util_mask], gr[util_mask] * tu[util_mask])
+
+    # (a) compute:mem balance, and (b) memory-parked jobs -- both approximate (peak mem).
+    def gpu_ratio_line():
+        if gpu_mem_w > 0:
+            R = gpu_w / gpu_mem_w
+            verdict = ("memory-heavy - GPUs fuller than busy" if R < 0.6
+                       else "compute-heavy - small memory footprint" if R > 1.7 else "balanced")
+            print(f"  compute:mem ratio  {R:.2f}  ({verdict})")
+
+    def parked_block():
+        pm = util_mask & (gpu_mem_eff_all > PARK_MEM) & (gpu_eff_all < PARK_COMPUTE)
+        p = job[pm].sort_values('idle_gpu_h', ascending=False).head(MAX_WASTE)
+        print(f"Memory-parked GPU jobs (GPU mem >{PARK_MEM * 100:.0f}%, compute <{PARK_COMPUTE * 100:.0f}%)"
+              " -- holding GPU memory while compute is idle")
+        if len(p):
+            print("  {:<13} {:<24} {:>9} {:>6} {:>6}".format("JOBID", "NAME", "IdleGPUh", "Mem%", "GPU%"))
+            for jid, r in p.iterrows():
+                print("  {:<13} {:<24.24} {:>9.1f} {:>6.0f} {:>6.0f}".format(
+                    str(jid), r['name'], r.idle_gpu_h, r.gpu_mem_eff * 100, r.gpu_eff * 100))
+        else:
+            print("  (none)")
+        print(GPU_MEM_NOTE)
+
+    # ---- header (always) -----------------------------------------------------
+    subject = account if account is not None else user
+    cluster_name = df_short['Cluster'].iloc[0]
+    state_norm = df_short['State'].astype(str).str.split().str[0]
+    sep = "=" * 64
+    excl = f"   (excl. {n_interactive} interactive)" if no_interactive and n_interactive else ""
+    print(sep)
+    print(f" {subject} @ {cluster_name}    {starttime} -> {endtime}    {len(job)} jobs{excl}")
+    print(sep)
+    states = "   ".join(f"{s} {int((state_norm == s).sum())}" for s in sorted(state_norm.unique()))
+    print(f"States         {states}")
+
+    def hist(title, data):
+        print(f'{title}\n' + '-' * 21)
+        counts, edges = np.histogram(data * 100, bins=np.linspace(0, 100, num=11))
+        labels = [f"{edges[i]:.1f} - {edges[i + 1]:.1f}%" for i in range(len(edges) - 1)]
+        fig = tpl.figure()
+        fig.barh(counts.tolist(), labels)
+        fig.show()
+        print()
+
+    n_gpu, n_util = int(gpu_mask.sum()), int(util_mask.sum())
+
+    # ---- GPU-only view -------------------------------------------------------
+    if view == 'gpu':
+        print()
+        if n_gpu == 0:
+            print("No GPU jobs in this window.  (run with -d for CPU / memory / time metrics)")
+            print(sep)
+            return
+        gpus_avg = job.loc[gpu_mask, 'gpu_req'].mean()
+        print(f"GPU jobs: {n_gpu}, {gpus_avg:.1f} GPU/job avg  ({n_util} with jobstats utilization data)")
+        if n_util == 0:
+            print("No jobstats GPU utilization data in this window -> GPU efficiency unavailable.")
+            print("(run with -d for CPU / memory / time metrics)")
+            print(sep)
+            return
+        print()
+        print(f"GPU efficiency   {'mean':>6}  {'weighted':>8}   bar = weighted (0-100%)")
+        print(f"  GPU          {gpu_eff.mean() * 100:5.1f}%   {gpu_w * 100:6.1f}%   {bar(gpu_w * 100)}")
+        print(f"  GPU Mem      {gpu_mem_eff.mean() * 100:5.1f}%   {gpu_mem_w * 100:6.1f}%   {bar(gpu_mem_w * 100)}")
+        print("  GPU = compute usage, GPU Mem = peak mem used / total; weighted by GPU-hours")
+        gpu_ratio_line()
+        print(f"Idle GPU-hours   {job.idle_gpu_h.sum():.0f}")
+        print()
+        top = job[gpu_mask].sort_values('idle_gpu_h', ascending=False).head(MAX_WASTE)
+        print("Most wasteful GPU jobs (by idle GPU-hours)")
+        print("  {:<13} {:<24} {:>8} {:>6}".format("JOBID", "NAME", "GPU-h", "GPU%"))
+        for jid, r in top.iterrows():
+            print("  {:<13} {:<24.24} {:>8.1f} {:>6.0f}".format(str(jid), r['name'], r.idle_gpu_h, r.gpu_eff * 100))
+        print()
+        parked_block()
+        print()
+        hist('GPU Efficiency (%)', gpu_eff)
+        hist('GPU Memory (%)', gpu_mem_eff)
+        print(sep)
+        return
+
+    # ---- CPU-only view -------------------------------------------------------
+    if view == 'cpu':
+        print()
+        print(f"CPU efficiency   {'mean':>6}  {'weighted':>8}   bar = weighted (0-100%)")
+        print(f"  CPU          {cpu_eff.mean() * 100:5.1f}%   {cpu_w * 100:6.1f}%   {bar(cpu_w * 100)}")
+        print(f"  CPU Mem      {mem_eff.mean() * 100:5.1f}%   {mem_w * 100:6.1f}%   {bar(mem_w * 100)}")
+        print("  CPU = cpu-time / (elapsed x cores); CPU Mem = MaxRSS / requested mem; weighted by core-hours")
+        print(f"Idle core-hours   {job.idle_core_h.sum():.0f}")
+        print()
+        top = job.sort_values('idle_core_h', ascending=False).head(MAX_WASTE)
+        print("Most wasteful jobs (by idle core-hours)")
+        print("  {:<13} {:<24} {:>9} {:>6} {:>6}".format("JOBID", "NAME", "CORE-h", "CPU%", "MEM%"))
+        for jid, r in top.iterrows():
+            print("  {:<13} {:<24.24} {:>9.1f} {:>6.0f} {:>6.0f}".format(
+                str(jid), r['name'], r.idle_core_h, r.cpu_eff * 100, r.mem_eff * 100))
+        print()
+        hist('CPU Efficiency (%)', cpu_eff)
+        hist('CPU Memory (%)', mem_eff)
+        print(sep)
+        return
+
+    # ---- full report (all metrics) -------------------------------------------
+    gpus_avg = job.loc[gpu_mask, 'gpu_req'].mean() if gpu_mask.any() else 0
+    print(f"Requested/job  {job.cpu_req.mean():.1f} cores / {job.nodes.mean():.2f} nodes   "
+          f"{gpus_avg:.1f} GPU   {job.mem_req.mean():.0f}G   {human_time(job.time_req.mean())}"
+          f"   (avg run {human_time(tu.mean())})")
+    print()
+    rows = [("CPU", cpu_eff.mean(), cpu_w)]
+    if util_mask.any():
+        rows.append(("GPU", gpu_eff.mean(), gpu_w))
+    rows.append(("CPU Mem", mem_eff.mean(), mem_w))
+    if util_mask.any():
+        rows.append(("GPU Mem", gpu_mem_eff.mean(), gpu_mem_w))
+    rows.append(("Time", time_eff.mean(), time_w))
+    print(f"Efficiency     {'mean':>6}  {'weighted':>8}   bar = weighted (0-100%)")
+    for name, m, w in rows:
+        print(f"  {name:<10} {m * 100:5.1f}%   {w * 100:6.1f}%   {bar(w * 100)}")
+    print("  weighted = total used / total allocated resource-hours")
+    if util_mask.any():
+        gpu_ratio_line()
+    if n_gpu and n_util < n_gpu:
+        tail = " - GPU efficiency unavailable" if n_util == 0 else ""
+        print(f"  GPU jobs: {n_gpu} ({n_util} with jobstats utilization data{tail})")
+    print()
+    print(f"Idle resources   {job.idle_gpu_h.sum():.0f} GPU-hours   {job.idle_core_h.sum():.0f} core-hours")
+    print()
+    by_gpu = gpu_mask.any()
+    top = job.sort_values('idle_gpu_h' if by_gpu else 'idle_core_h', ascending=False).head(MAX_WASTE)
+    print(f"Most wasteful jobs (by {'idle GPU-hours' if by_gpu else 'idle core-hours'})")
+    print("  {:<13} {:<22} {:>8} {:>9} {:>5} {:>5} {:>5}".format("JOBID", "NAME", "GPU-h", "CORE-h", "GPU%", "CPU%", "MEM%"))
+    for jid, r in top.iterrows():
+        print("  {:<13} {:<22.22} {:>8.1f} {:>9.1f} {:>5.0f} {:>5.0f} {:>5.0f}".format(
+            str(jid), r['name'], r.idle_gpu_h, r.idle_core_h, r.gpu_eff * 100, r.cpu_eff * 100, r.mem_eff * 100))
+    print()
+    if util_mask.any():
+        parked_block()
+        print()
+    print("Efficiency distributions  (number of jobs per 10% bucket)\n")
+    if util_mask.any():
+        hist('GPU Efficiency (%)', gpu_eff)
+        hist('GPU Memory (%)', gpu_mem_eff)
+    hist('CPU Efficiency (%)', cpu_eff)
+    hist('CPU Memory (%)', mem_eff)
+    hist('Time Efficiency (%)', time_eff)
+    print(sep)
+
+
+if __name__ == "__main__":
+
+    desc = (
+        """
+    seff_history v%s  (based on https://github.com/fasrc/seff-account)
+    ---------------
+    An extension of 'seff' that summarizes job efficiency for a user or account over a period of
+    time and displays it as histograms.
+
+    Pass a user (-u) or account (-A); for accounts you are not a member of you must be a Slurm
+    Operator or Administrator. Time arguments (-S/-E) match the sacct command (default: last day);
+    -D N is shorthand for the last N days.
+    Choose which metrics to show with --cpu, --gpu, or --full; if none is given it prompts
+    interactively (defaulting to full), or just uses full when output is not a terminal. The full
+    report has job-state counts, average requested resources, simple-mean and resource-weighted
+    CPU/GPU/Memory/Time efficiency, the most wasteful jobs, the GPU compute:mem ratio, memory-parked
+    GPU jobs, and efficiency-distribution histograms; --cpu and --gpu show focused subsets.
+
+    CPU efficiency = cpu-time / (elapsed x requested cores). GPU efficiency uses jobstats. Memory
+    efficiency = MaxRSS / requested memory. Time efficiency = elapsed / requested time. The
+    resource-weighted figures divide total used by total allocated resource-hours.
+    -----------------
+    """
+        % __version__
+    )
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=desc,
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-u", "--user", action="store", dest="user", help="user (default: current user, $USER)")
+    group.add_argument("-A", "--account", action="store", dest="account")
+    parser.add_argument("-S", "--starttime", action="store", dest="starttime", default=None)
+    parser.add_argument("-E", "--endtime", action="store", dest="endtime", default=None)
+    parser.add_argument("-D", "--days", action="store", dest="days", type=int, default=None,
+                        help="report the last N days (shorthand for -S now-Ndays -E now)")
+    parser.add_argument("-c", "--cluster", action="store", dest="cluster", default=os.getenv('SLURM_CLUSTER_NAME'))
+    mg = parser.add_mutually_exclusive_group()
+    mg.add_argument("--cpu", action="store_const", const="cpu", dest="metrics", help="show CPU metrics only")
+    mg.add_argument("--gpu", action="store_const", const="gpu", dest="metrics", help="show GPU metrics only")
+    mg.add_argument("--full", action="store_const", const="full", dest="metrics", help="show all metrics (default)")
+    parser.add_argument("--no-interactive", action="store_true", dest="no_interactive",
+                        help="exclude interactive jobs: JobName like interactive/jupyter/OnDemand/shell, OR a job with a .interactive step (salloc / srun --pty)")
+    parser.add_argument('--version', action='version', version='%(prog)s {version}'.format(version=__version__))
+    args = parser.parse_args()
+
+    # Default to the current user ($USER) when neither -u nor -A is given.
+    if args.user is None and args.account is None:
+        args.user = os.environ.get("USER")
+        if not args.user:
+            try:
+                args.user = getpass.getuser()
+            except Exception:
+                args.user = None
+        if not args.user:
+            parser.error("no -u/-A given and could not determine the current user from $USER")
+
+    # -D/--days is a shorthand window; otherwise -S/-E (defaulting to the last 1 day).
+    if args.days is not None:
+        if args.days <= 0:
+            parser.error("-D/--days must be a positive integer")
+        if args.starttime or args.endtime:
+            parser.error("-D/--days sets the window; do not also pass -S/-E")
+        args.starttime, args.endtime = f"now-{args.days}days", "now"
+    else:
+        if args.starttime is None:
+            args.starttime = "now-1days"
+        if args.endtime is None:
+            args.endtime = "now"
+
+    # Metric view: --cpu/--gpu/--full, else prompt interactively, else full.
+    if args.metrics is None:
+        if sys.stdin.isatty():
+            ans = input("Show metrics? [c]pu / [g]pu / [f]ull (default full): ").strip().lower()
+            args.metrics = {'c': 'cpu', 'cpu': 'cpu', 'g': 'gpu', 'gpu': 'gpu',
+                            'f': 'full', 'full': 'full'}.get(ans, 'full')
+        else:
+            args.metrics = 'full'
+
+    job_eff(args.user, args.account, args.starttime, args.endtime, args.cluster, args.no_interactive, args.metrics)

@@ -1,0 +1,465 @@
+#!/usr/bin/python3
+# stotal_kempner calculates the total CPU-hours, Mem-hours, GPU-hours, and
+# TRES-hours for a Slurm user, account, or partition over a time window, or for
+# the last N jobs -- RESTRICTED to jobs that ran on Kempner-owned nodes.
+#
+# Kempner nodes are the de-duplicated union of the KEMPNER_PARTITIONS below; every
+# sacct query is filtered with --nodelist of that set, so only usage on Kempner
+# hardware is counted (including jobs that reached those nodes via non-Kempner
+# partitions such as requeue pools).
+#
+# Customized standalone copy of /usr/local/bin/stotal (fasrc/stotal).
+# Output format and CLI of the original window mode are unchanged; changes:
+#   - The -a/--all (whole-cluster) mode was removed. On a large cluster a
+#     cluster-wide sacct query returns hundreds of thousands of rows per day and
+#     gets OOM-killed, which the original tool silently reported as 0. Use -A.
+#   - Omitting -u/-A now defaults to the current user ($USER) instead of crashing
+#     with UnboundLocalError.
+#   - A job on a since-deleted/renamed partition no longer aborts the run; unknown
+#     partitions are treated as zero TRES weight, counted, and reported on stderr.
+#   - A partition missing CPU/Mem (or null) TRESBillingWeights no longer crashes
+#     the partition-table build; missing weights default to 0.
+#   - sacct/scontrol run under a hard --timeout (default 60s) and their exit
+#     status is checked, so a hung/killed/failed query is reported, not hidden.
+# The brittle nested try/except used for dict initialization is replaced with
+# defaultdict; bare excepts are removed.
+#
+# -p/--partition reports usage for a single partition (sacct -r), with -d breaking
+# it down by account and then the users within each account. It is a bounded
+# query (one partition), unlike the removed cluster-wide -a.
+#
+# -N/--lastn N reports usage for the most recent N jobs (by start time) instead
+# of a fixed window. -S/-E become optional in this mode and bound the search
+# (default: now-30days .. now). The summary header reports the actual span
+# (earliest start, latest end) and the number of jobs counted; each job is
+# counted in full (no window clamping).
+
+import sys,os,subprocess,shlex,getpass,signal
+import argparse
+import time,datetime
+from datetime import date
+from collections import defaultdict
+
+PATTERN = '%Y-%m-%dT%H:%M:%S'
+
+# Kempner-owned nodes are defined as the union of these partitions' nodes. The
+# requeue partition spans all Kempner hardware; eng/interactive are listed so any
+# node not in requeue is still covered. (On this cluster this union equals the set
+# of nodes across all kempner* partitions.)
+KEMPNER_PARTITIONS = "kempner_requeue,kempner_eng,kempner_interactive"
+
+# Collapse a Slurm typed-GRES name to a short GPU model, e.g.
+#   nvidia_h100_80gb_hbm3 -> h100,  nvidia_a100-sxm4-40gb -> a100,
+#   nvidia_a100_3g.20gb -> a100 (MIG slices fold into the base model),
+#   nvidia_h200 -> h200,  nvidia_rtx_a6000 -> a6000,  tesla_v100-pcie-32gb -> v100.
+def gpu_short(t):
+  t = t.lower()
+  for pref in ('nvidia_', 'tesla_'):
+    if t.startswith(pref):
+      t = t[len(pref):]
+      break
+  if t.startswith('rtx_'):
+    t = t[4:]
+  for i, ch in enumerate(t):
+    if ch in '-_.':
+      return t[:i]
+  return t
+
+# Run a command, capture stdout, and enforce a hard timeout so a slow or large
+# sacct/scontrol query cannot hang the tool indefinitely. timeout=None disables it.
+# The child runs in its own session so that on timeout the whole process group can
+# be killed -- this bounds wall-clock even if the child spawned subprocesses that
+# still hold the stdout pipe open.
+def run_capture(cmd, timeout, what):
+  try:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            universal_newlines=True, start_new_session=True)
+  except FileNotFoundError:
+    sys.exit(f"ERROR: command not found: {cmd[0]}")
+  try:
+    out, err = proc.communicate(timeout=timeout)
+  except subprocess.TimeoutExpired:
+    try:
+      os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+      proc.kill()
+    try:
+      proc.communicate(timeout=5)
+    except Exception:
+      pass
+    sys.exit(f"ERROR: {what} timed out after {timeout:g}s. Narrow the query with "
+             f"-S/-E or -N, or raise the limit with --timeout (--timeout 0 disables it).")
+  if proc.returncode != 0:
+    if proc.returncode < 0:
+      sig = -proc.returncode
+      hint = " -- often out of memory; narrow the query with -A/-S/-E or -N" if sig == 9 else ""
+      sys.exit(f"ERROR: {what} was killed by signal {sig}{hint}.")
+    sys.exit(f"ERROR: {what} failed (exit {proc.returncode}): {(err or '').strip()}")
+  return out
+
+# Return the sorted, de-duplicated list of Kempner-owned node names. sinfo -N
+# prints one row per node-per-partition, so a node in several of the partitions
+# appears multiple times; the set() collapses those duplicates.
+def kempner_nodes(timeout):
+  out = run_capture(['sinfo','-h','-N','-o','%N','-p',KEMPNER_PARTITIONS], timeout,
+                    f"sinfo -p {KEMPNER_PARTITIONS}")
+  nodes = sorted({n.strip() for n in out.splitlines() if n.strip()})
+  if not nodes:
+    sys.exit(f"ERROR: no nodes found in partitions {KEMPNER_PARTITIONS}; cannot restrict to Kempner nodes.")
+  return nodes
+
+# Print the Window/Start/End/(Jobs)/Total-Hours block shared by all modes.
+# lastn is the requested count (truthy) only in last-N mode; njobs is the actual
+# number of jobs counted. In window mode lastn is None and the output is identical
+# to the original tool.
+def print_window(csv, lastn, instarttime, inendtime, hourrange, njobs):
+  if csv:
+    print(f"Start,{instarttime}")
+    print(f"End,{inendtime}")
+    if lastn:
+      print(f"Jobs,{njobs}")
+    print(f"Total Hours,{hourrange:.2f}")
+  else:
+    if lastn:
+      print(f"Window (last {njobs} jobs)")
+    else:
+      print(f"Window")
+    print(f"  Start: {instarttime}")
+    print(f"  End:   {inendtime}")
+    if lastn:
+      print(f"  Jobs:  {njobs}")
+    print(f"Total Hours: {hourrange:.2f}")
+
+# Calculate Usage
+def calc_usage(inuser, inaccount, inpartition, instarttime, inendtime, header, details, csv, lastn, breakdown, timeout):
+
+  # In last-N mode -S/-E are optional and bound the job search.
+  if lastn:
+    search_S = instarttime if instarttime else 'now-30days'
+    search_E = inendtime if inendtime else 'now'
+  else:
+    search_S, search_E = instarttime, inendtime
+
+  # Get job data. A hard timeout guards against a slow/large query hanging.
+  sacct_cmd = ['sacct','-anPXD','--units=G','--format=User,Account,Partition,Start,End,AllocTRES,ElapsedRaw','-S',search_S,'-E',search_E]
+  # -u/-A/-p are independent filters that AND together (e.g. -A x -p y).
+  if inuser != None:
+    sacct_cmd += ['-u', inuser]
+  if inaccount != None:
+    sacct_cmd += ['-A', inaccount]
+  if inpartition != None:
+    sacct_cmd += ['-r', inpartition]
+  # Restrict to jobs that ran on Kempner-owned nodes (catches usage of Kempner
+  # hardware even through non-Kempner partitions).
+  sacct_cmd += ['--nodelist', ','.join(kempner_nodes(timeout))]
+  sacct_out = run_capture(sacct_cmd, timeout, "sacct query")
+
+  # Window mode: convert -S/-E to integer time. sacct defaults to 00:00:00 for both.
+  if not lastn:
+    if 'T' not in instarttime:
+      instarttime=instarttime+'T00:00:00'
+    if 'T' not in inendtime:
+      inendtime=inendtime+'T00:00:00'
+    instart = int(time.mktime(time.strptime(instarttime, PATTERN)))
+    inend = int(time.mktime(time.strptime(inendtime, PATTERN)))
+    hourrange = (inend - instart)/3600.0
+
+  # Get Partition TRES Table
+  ptresweightcpu={}
+  ptresweightmem={}
+  ptresweightgpu={}
+  part_out = run_capture(['scontrol','-o','show','partition'], timeout, "scontrol show partition")
+  for line in part_out.splitlines():
+    #Sanitize input
+    line = line.replace("'", "\\'")
+
+    #Turn partition information into a hash
+    part = dict(s.split("=", 1) for s in shlex.split(line) if '=' in s)
+
+    #Get the TRESBillingWeights for a partition. Missing/null weights default to 0
+    #so a partition without (full) billing weights cannot crash the table build.
+    tresweight = dict(s.split("=", 1) for s in shlex.split(part.get('TRESBillingWeights','').replace(",", " ")) if '=' in s)
+    pn = part["PartitionName"]
+    cpu_w = tresweight.get('CPU')
+    mem_w = tresweight.get('Mem')
+    gpu_w = tresweight.get('Gres/gpu')
+    ptresweightcpu[pn] = float(cpu_w) if cpu_w else 0.0
+    ptresweightmem[pn] = float(mem_w.strip('G')) if mem_w else 0.0
+    ptresweightgpu[pn] = float(gpu_w) if gpu_w else 0.0
+
+  # Single accumulator keyed by (account, user, partition, gpu_type) -> [cpu, mem,
+  # gpu, tres] hours. Every view aggregates up from this to whatever grouping the
+  # detail level needs, so the output can drop columns that turn out constant.
+  bd = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0])
+
+  # Partitions seen on jobs but absent from the current partition table.
+  missing_parts = set()
+
+  # Parse an AllocTRES string into (cpu, mem_GB, gpu, gpu_type). gpu_type is the
+  # short GPU model (h100, a100, h200, ...) from "gres/gpu:<type>=N"; "(none)" for
+  # CPU-only jobs, "gpu" if a GPU count exists but carries no type label.
+  def parse_tres(alloctres):
+    atres = dict(s.split("=", 1) for s in shlex.split(alloctres.replace(",", " ")) if '=' in s)
+    cpu = int(atres["cpu"])
+    mem = float(atres["mem"].strip("G"))
+    gpu = int(atres['gres/gpu']) if 'gres/gpu' in atres else 0
+    if gpu > 0:
+      types = sorted({gpu_short(k.split(':', 1)[1]) for k in atres if k.startswith('gres/gpu:')})
+      gpu_type = '+'.join(types) if types else 'gpu'
+    else:
+      gpu_type = '(none)'
+    return cpu, mem, gpu, gpu_type
+
+  # Add one job's in-window hours to the (account, user, partition, gpu_type)
+  # accumulator (elapsedhours already computed and clamped by the caller).
+  def add_job(account, user, partition, gpu_type, cpu, mem, gpu, elapsedhours):
+    if partition not in ptresweightcpu:
+      missing_parts.add(partition)
+    wcpu = ptresweightcpu.get(partition, 0.0)
+    wmem = ptresweightmem.get(partition, 0.0)
+    wgpu = ptresweightgpu.get(partition, 0.0)
+    b = bd[(account, user, partition, gpu_type)]
+    b[0] += cpu*elapsedhours
+    b[1] += mem*elapsedhours
+    b[2] += gpu*elapsedhours
+    b[3] += (wcpu*float(cpu) + wmem*mem + wgpu*float(gpu))*float(elapsedhours)
+
+  if lastn:
+    # ---- Last-N-jobs mode -------------------------------------------------
+    # Collect every job that actually ran in the search window, then keep the
+    # N most recent by start time. Each kept job is counted in full.
+    cands = []
+    for job in sacct_out.splitlines():
+      (user,account,partition,start,end,alloctres,elapsedraw) = job.strip().split('|')
+      if alloctres == "" or start == "Unknown":
+        continue
+      cands.append((int(time.mktime(time.strptime(start, PATTERN))),
+                    user,account,partition,start,end,elapsedraw,alloctres))
+    cands.sort(key=lambda r: r[0], reverse=True)
+    sel = cands[:lastn]
+    njobs = len(sel)
+
+    if njobs == 0:
+      instarttime = inendtime = "(no matching jobs)"
+      hourrange = 0.0
+    else:
+      now = int(time.time())
+      starts = []
+      ends = []
+      for (s,user,account,partition,start,end,elapsedraw,alloctres) in sel:
+        e = now if end == "Unknown" else int(time.mktime(time.strptime(end, PATTERN)))
+        starts.append(s)
+        ends.append(e)
+        cpu,mem,gpu,gpu_type = parse_tres(alloctres)
+        elapsedhours = max(float(int(elapsedraw)),0.)/3600.
+        add_job(account, user, partition, gpu_type, cpu, mem, gpu, elapsedhours)
+      instart = min(starts)
+      inend = max(ends)
+      instarttime = time.strftime(PATTERN, time.localtime(instart))
+      inendtime = time.strftime(PATTERN, time.localtime(inend))
+      hourrange = (inend - instart)/3600.0
+  else:
+    # ---- Window mode (original behaviour) ---------------------------------
+    for job in sacct_out.splitlines():
+      (user,account,partition,start,end,alloctres,elapsedraw) = job.strip().split('|')
+
+      # Ignore jobs that have no allocation. That means they have never run.
+      if alloctres != "":
+        # Converting time to integer time.
+        if end == "Unknown":
+          end = inendtime
+        start = int(time.mktime(time.strptime(start, PATTERN)))
+        end = int(time.mktime(time.strptime(end, PATTERN)))
+
+        # Check if job actually ran in window.
+        if start < inend:
+          cpu,mem,gpu,gpu_type = parse_tres(alloctres)
+
+          # Cap the usage to the specified window. Jobs may run before/after the
+          # window, but we only count the portion inside it. Relies on elapsedraw
+          # and subtracting overage, which handles DST correctly.
+          elapsedwindow = int(elapsedraw)
+          if start < instart:
+            elapsedwindow = elapsedwindow - (instart - start)
+          if end > inend:
+            elapsedwindow = elapsedwindow - (end - inend)
+          elapsedwindow = max(float(elapsedwindow),0.)/3600.
+
+          add_job(account, user, partition, gpu_type, cpu, mem, gpu, elapsedwindow)
+
+  # ---- Output ----------------------------------------------------------------
+  # Grouping columns by detail level. A grouping column with a single value across
+  # all rows is dropped from the table and shown once as a context line, so e.g.
+  # "-A foo" or "-A foo -p bar" does not repeat foo/bar on every row.
+  DIMIDX = {'Account': 0, 'User': 1, 'Partition': 2, 'GPU': 3}
+  WIDTH  = {'Account': 20, 'User': 16, 'Partition': 22, 'GPU': 8}
+  METRIC_COLS = ['CPU-Hours', 'Mem-Hours(GB)', 'GPU-Hours', 'TRES-Hours']
+  if breakdown:
+    dims = ['Account', 'User', 'Partition', 'GPU']
+  elif details:
+    dims = ['Account', 'User']
+  else:
+    dims = []
+
+  # Aggregate bd up to the active grouping dims; compute the grand total.
+  agg = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0])
+  gtot = [0.0, 0.0, 0.0, 0.0]
+  for key, vals in bd.items():
+    gk = tuple(key[DIMIDX[d]] for d in dims)
+    row = agg[gk]
+    for i in range(4):
+      row[i]  += vals[i]
+      gtot[i] += vals[i]
+
+  # Split grouping dims into constant (-> context line) and varying (-> columns).
+  const = {}
+  varying = []
+  for i, d in enumerate(dims):
+    seen_vals = {gk[i] for gk in agg}
+    if len(seen_vals) <= 1:
+      const[d] = next(iter(seen_vals)) if seen_vals else ''
+    else:
+      varying.append(d)
+
+  def mrow(m):
+    return f"{m[0]:>14.2f} {m[1]:>14.2f} {m[2]:>14.2f} {m[3]:>14.2f}"
+
+  if csv:
+    # CSV keeps every grouping column (machine-readable; no dropping).
+    if header:
+      print_window(csv, lastn, instarttime, inendtime, hourrange, njobs if lastn else None)
+    if dims:
+      if header:
+        print(",".join(dims + METRIC_COLS))
+      for gk in sorted(agg):
+        m = agg[gk]
+        print(",".join(list(gk) + [str(m[0]), str(m[1]), str(m[2]), str(m[3])]))
+      print(",".join(['Total'] + ['']*(len(dims)-1) + [str(gtot[0]), str(gtot[1]), str(gtot[2]), str(gtot[3])]))
+    else:
+      if header:
+        print(",".join([''] + METRIC_COLS))
+      print(",".join(['Total', str(gtot[0]), str(gtot[1]), str(gtot[2]), str(gtot[3])]))
+  else:
+    vidx = [dims.index(d) for d in varying]
+    lead_labels = " ".join(f"{d:<{WIDTH[d]}}" for d in varying)
+    leadw = len(lead_labels) if varying else 22
+    if header:
+      print_window(csv, lastn, instarttime, inendtime, hourrange, njobs if lastn else None)
+      # Context: active filters first, then any other constant grouping dim.
+      ctx, seen = [], set()
+      for label, val in (('Account', inaccount), ('User', inuser), ('Partition', inpartition)):
+        if val:
+          ctx.append((label, val)); seen.add(label)
+      for d in dims:
+        if d in const and const[d] and d not in seen:
+          ctx.append((d, const[d])); seen.add(d)
+      for label, val in ctx:
+        print(f"  {label + ':':<11}{val}")
+      print(f"{lead_labels:<{leadw}} {'CPU-Hours':>14} {'Mem-Hours(GB)':>14} {'GPU-Hours':>14} {'TRES-Hours':>14}")
+    if varying:
+      for gk in sorted(agg):
+        rlead = " ".join(f"{gk[j]:<{WIDTH[d]}}" for d, j in zip(varying, vidx))
+        print(f"{rlead:<{leadw}} {mrow(agg[gk])}")
+    print(f"{'Total:':<{leadw}} {mrow(gtot)}")
+
+  # Report partitions that no longer exist (zero-weighted in TRES above).
+  if missing_parts:
+    print(f"WARNING: {len(missing_parts)} partition(s) had no current billing weights and "
+          f"were counted with zero TRES weight: {', '.join(sorted(missing_parts))}", file=sys.stderr)
+
+# Code starts here.
+if __name__ == "__main__":
+
+  desc = (
+  """
+  stotal_kempner  (based on https://github.com/fasrc/stotal)
+  -----------------
+
+  Calculates the total CPU-hours, GPU-hours, and TRES-hours for a Slurm user,
+  account, or partition -- restricted to jobs that ran on Kempner-owned nodes
+  (the de-duplicated union of: """ + KEMPNER_PARTITIONS + """).
+
+  -u/-A/-p are combinable filters (they AND together, e.g. -A foo -p bar). -d breaks
+  the total down by account+user; -b also by partition+gpu type. Any grouping column
+  that is constant (e.g. the account you filtered on) is dropped from the table and
+  shown once as a context line, so values are not repeated on every row.
+  If no filter (-u/-A/-p) is given, it defaults to the current user ($USER).
+  Time arguments for starttime and endtime are the same as the sacct command.
+  Note that for information on other users (even in your own account) and accounts the user must be either an Operator or Administrator.
+
+  With -N/--lastn, usage is reported for the most recent N jobs instead of a fixed
+  window. -S/-E then bound the search (default: now-30days .. now) and the summary
+  header reports the actual start/end span and the number of jobs counted.
+
+  With -D/--days N, the window is set to the last N days (now-Ndays .. now), as a
+  shorthand for -S/-E. The summary header shows the resolved start/end.
+
+  If no time scope at all is given (no -S/-E, no -D, no -N), the tool defaults to
+  the last 1 day. So a bare "stotal_kempner" reports your own last day of usage.
+
+  -----------------
+  """
+  )
+
+  parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    description=desc,
+  )
+
+  group = parser.add_argument_group("filters (combinable; AND together)")
+  group.add_argument("-u", "--user", action="store", dest="user", help="Filter to this user (default: the current user, $USER, when no filter is given).")
+  group.add_argument("-A", "--account", action="store", dest="account", help="Filter to this account. Requires being Operator or Administrator to see accounts you are not in.")
+  group.add_argument("-p", "--partition", action="store", dest="partition", help="Filter to this partition. Requires Operator/Administrator to see other users.")
+  parser.add_argument("-S", "--starttime", action="store", dest="starttime", default=None, help="Start time (sacct format). With -N it bounds the search (default now-30days). If no window, -D, or -N is given at all, the tool defaults to the last 1 day.")
+  parser.add_argument("-E", "--endtime", action="store", dest="endtime", default=None, help="End time (sacct format). With -N it bounds the search (default now).")
+  parser.add_argument("-N", "--lastn", action="store", dest="lastn", type=int, default=None, help="Report usage for the most recent N jobs (by start time) instead of a fixed window.")
+  parser.add_argument("-D", "--days", action="store", dest="days", type=int, default=None, help="Report usage over the last N days (sets the window to now-Ndays .. now). Alternative to -S/-E.")
+  parser.add_argument("-n","--noheader", action="store_false", dest="header")
+  parser.add_argument("-d","--details", action="store_true", dest="details", help="Break the total down by account and user (columns that are constant given the filters are dropped and shown once as context).")
+  parser.add_argument("-b","--breakdown", action="store_true", dest="breakdown", help="Break the total down by account, user, partition and gpu type (constant columns dropped and shown as context).")
+  parser.add_argument("--csv", action="store_true", dest="csv", help="Will dump the data in comma seperated values (CSV) format")
+  parser.add_argument("--timeout", action="store", dest="timeout", type=float, default=60.0, help="Seconds to wait for each sacct/scontrol call before aborting (default 60). Use 0 to disable.")
+  args = parser.parse_args()
+
+  # When no selector is given, default to the current user ($USER). -A and -p are
+  # explicit selectors and do not get a default user.
+  if args.user is None and args.account is None and args.partition is None:
+    default_user = os.environ.get("USER")
+    if not default_user:
+      try:
+        default_user = getpass.getuser()
+      except Exception:
+        default_user = None
+    if not default_user:
+      parser.error("no -u/-A/-p given and could not determine the current user from $USER")
+    args.user = default_user
+
+  # If no time scope at all is given (no window, no -N, no -D), default to the
+  # last 1 day.
+  if args.lastn is None and args.days is None and not args.starttime and not args.endtime:
+    args.days = 1
+
+  # -D/--days is a convenience that resolves to a concrete now-Ndays .. now window.
+  if args.days is not None:
+    if args.days <= 0:
+      parser.error("-D/--days must be a positive integer")
+    if args.lastn is not None:
+      parser.error("-D/--days cannot be combined with -N/--lastn")
+    if args.starttime or args.endtime:
+      parser.error("-D/--days sets the window; do not also pass -S/-E")
+    now = time.time()
+    args.endtime = time.strftime(PATTERN, time.localtime(now))
+    args.starttime = time.strftime(PATTERN, time.localtime(now - args.days*86400))
+
+  # -S/-E are required for window mode; optional (search bounds) for last-N mode.
+  if args.lastn is not None:
+    if args.lastn <= 0:
+      parser.error("-N/--lastn must be a positive integer")
+  else:
+    if not args.starttime or not args.endtime:
+      parser.error("both -S/--starttime and -E/--endtime are required for an explicit window (or use -D/--days or -N/--lastn)")
+
+  # A non-positive timeout disables the limit (passed to subprocess as None).
+  timeout = args.timeout if args.timeout and args.timeout > 0 else None
+
+  calc_usage(args.user, args.account, args.partition, args.starttime, args.endtime, args.header, args.details, args.csv, args.lastn, args.breakdown, timeout)
