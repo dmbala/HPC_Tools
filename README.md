@@ -12,6 +12,34 @@ HPC_Tools/
 └── analysis/   # post-processing: history.jsonl → reports / verdicts / trends
 ```
 
+## Setup
+
+These are operational tools meant to run **on the cluster** against live Slurm /
+Prometheus / InfiniBand — not on a laptop. There's nothing to build: clone the
+repo onto a shared filesystem and run each tool in place (the executable bit is
+preserved by git).
+
+```bash
+git clone https://github.com/dmbala/HPC_Tools.git
+cd HPC_Tools
+./slurm/jobstats_history --help
+```
+
+Optionally put the tool dirs on your `PATH`:
+
+```bash
+export PATH="$PWD/slurm:$PWD/gpu:$PWD/fabric:$PATH"
+```
+
+### Requirements by directory
+
+| Dir | Run where | Needs |
+|---|---|---|
+| `slurm/` | any node with the Slurm client | `sacct` (and `scontrol` for `stotal_kempner`); Python 3 standard library only. **`seff_history`** additionally needs `numpy`, `pandas`, and `termplotlib` — its shebang points at the FASRC `seff-array` env (`/n/sw/envs/seff-array/bin/python3`); repoint it if that env isn't on your cluster. |
+| `gpu/` | wherever `jobstats` is installed | the jobstats `config` / `jobstats` Python modules (auto-discovered on `/usr/local/bin` or `/usr/bin`), the `requests` module (ships with jobstats), and a reachable Prometheus (`PROM_SERVER`, read from the jobstats `config`). |
+| `fabric/` | on the target GPU node (no allocation needed) | host tools `nvidia-smi`, `ibstat`, `ibv_devinfo`, `ibdev2netdev`, plus `python3`. All probes are read-only. |
+| `analysis/` | anywhere with Python 3 | Python 3 standard library only — runs offline on a `history.jsonl` file. |
+
 ## slurm/ — job accounting & utilization
 
 Read from Slurm `sacct` (and the jobstats `AdminComment` blob). No GPU
