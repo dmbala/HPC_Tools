@@ -21,7 +21,7 @@ This shows GPU jobs from the last 5 days and adds DCGM utilization columns.
 Then inspect one job in detail:
 
 ```bash
-./jobstats_dcgm 17487044
+./jobstats_dcgm --all 17487044
 ```
 
 Add a simple advisory label:
@@ -164,5 +164,4 @@ Run the full help at any time:
 - KempnerPulse for live monitoring:
   <https://github.com/KempnerInstitute/kempnerpulse>
 
-Author: Bala Desinghu, Senior AI/HPC Research Computing Engineer, Kempner
-Institute, Harvard.
+
