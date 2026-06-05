@@ -17,73 +17,87 @@ Both read the same data `jobstats` uses, so the numbers line up with it.
 
 ---
 
-## 1. Quick look: is my GPU efficiency OK? → `jobstats_history`
+## 1. Quick look: did your GPUs actually work? → `jobstats_history`
 
-Start here. One command sweeps **all your jobs over the last few days** and
-prints a one-line-per-job table. It is cheap — a single `sacct` query, no
-per-job calls, no job-count cap — so you can scan a whole week at once.
+**Start here.** One command lines up every GPU job you ran over the last few days
+and shows — at a glance — whether the GPU was *doing work* or just sitting there
+powered on:
 
 ```bash
-./jobstats_history -D 5 --gpu
+./jobstats_history --gpu --dcgm -D 5
 ```
 
-`-D 5` = the last 5 days; `--gpu` = show the GPU columns only (and drop any
-CPU-only jobs). Example output:
+`--gpu` keeps GPU jobs only, `--dcgm` adds the *real* utilization columns, `-D 5`
+covers the last 5 days. Example:
 
 ```
   User:      bdesinghu
   Select:    last 5 days
 
-JOBID        STATE     GPUS GPU%   GMEM%   RUNTIME      NAME
----------------------------------------------------------------------
-17487020     COMPLETED 4    91     78      1-04:11:30   train_llama
-17487044     COMPLETED 4    12     61      08:22:10     sweep_lr
-17490318     COMPLETED 1    88     44      03:10:00     eval_run
-17491002     FAILED    8    3      9       00:04:55     debug_ddp
----------------------------------------------------------------------
-Mean:                      48     48
+JOBID        STATE      GPUS GPU% GMEM% SM_ACT% OCC%  TENSOR% DRAM% POWER_W RUNTIME      NAME
+--------------------------------------------------------------------------------------------------------
+17487020     COMPLETED  4    91   78    62.4    38.1  71.0    45.2  642     1-04:11:30   train_llama
+17487044     COMPLETED  4    88   61    11.1    6.0   0.0     7.8   120     08:22:10     sweep_lr
+17490318     COMPLETED  1    70   44    48.6    29.4  0.0     33.0  523     03:10:00     eval_run
+17491002     FAILED     8    3    9     0.4     0.2   0.0     0.1   74      00:04:55     debug_ddp
+--------------------------------------------------------------------------------------------------------
+Mean:                        63   48    30.6    18.4  17.8    21.5  340
 ```
 
-How to read it:
+**Here's the catch this view exposes.** Look at `sweep_lr`: its `GPU%` is **88** —
+by the usual duty-cycle number it looks busy. But `SM_ACT%` is **11**: the GPU was
+*switched on* the whole run while its cores did almost nothing. `GPU%` alone would
+have fooled you; the DCGM columns tell the truth.
 
-- **`GPU%`** is the GPU **duty cycle** — the fraction of the run during which at
-  least one kernel was running. It is the headline efficiency number: high is
-  what you want, low means the GPU sat idle a lot.
-- **`GMEM%`** is the peak GPU memory you used out of what was allocated.
-- The **`Mean:`** row at the bottom averages each column across your jobs, so you
-  get a one-glance sense of your overall efficiency.
+Reading left to right:
 
-In the example, `train_llama` (91%) and `eval_run` (88%) look healthy, but
-`sweep_lr` (12%) and `debug_ddp` (3%) barely touched their GPUs — those are the
-ones worth a closer look.
+| Column | The question it answers |
+|---|---|
+| `GPU%` | Was *a* kernel running? (duty cycle — coarse; high is necessary, not sufficient) |
+| `SM_ACT%` | Were the cores actually busy? **← the honest efficiency number** |
+| `OCC%` | How full were the cores? (low → small kernels / weak parallelism) |
+| `TENSOR%` | Were tensor cores used? (~0 on an ML job → no mixed precision) |
+| `DRAM%` | Was memory bandwidth the bottleneck? |
+| `POWER_W` | Sanity check — near-idle watts mean the GPU was coasting |
 
-Want a verdict instead of eyeballing numbers? Add **`--diagnose`** to get an
-advisory `DIAG` tag per job (`idle` / `underfed` / `low-occ` / `mem-bound` /
-`no-tensor` / `ok`):
+The **`Mean:`** row sums it up: across these five days your jobs averaged 63% duty
+cycle but only ~31% real SM activity — a lot of allocated-but-idle GPU time.
+`train_llama` is genuinely healthy (cores hot, tensor cores at 71%); `sweep_lr`
+and `eval_run` were **underfed** (busy in time, idle in compute); `debug_ddp` never
+really started.
+
+> **Lighter glance, no network.** Drop `--dcgm` and you get just `GPU%`/`GMEM%`
+> from a single, instant `sacct` query — no Prometheus, works anywhere, no
+> job-count cap. Add `--dcgm` when you want the honest utilization columns; they
+> cost a quick Prometheus fetch per GPU job (run concurrently) and must run where
+> `jobstats` lives.
+
+**Want the tool to grade each job for you?** Add `--diagnose` for a one-word
+verdict per job (`idle` / `underfed` / `low-occ` / `mem-bound` / `no-tensor` /
+`ok`):
 
 ```bash
-./jobstats_history -D 5 --gpu --diagnose
+./jobstats_history --gpu --diagnose -D 5
 ```
 
 ```
-JOBID        STATE     GPUS GPU%   GMEM%   DIAG               RUNTIME      NAME
-17487020     COMPLETED 4    91     78      ok                 1-04:11:30   train_llama
-17487044     COMPLETED 4    12     61      underfed           08:22:10     sweep_lr
-17491002     FAILED    8    3      9       idle               00:04:55     debug_ddp
+JOBID        STATE      GPUS GPU% GMEM% DIAG       RUNTIME      NAME
+17487020     COMPLETED  4    91   78    ok         1-04:11:30   train_llama
+17487044     COMPLETED  4    88   61    underfed   08:22:10     sweep_lr
+17490318     COMPLETED  1    70   44    no-tensor  03:10:00     eval_run
+17491002     FAILED     8    3    9     idle       00:04:55     debug_ddp
 ```
 
-> `--diagnose` (like `--dcgm`) pulls a small set of metrics from the jobstats
-> Prometheus for each GPU job, so it is a bit slower than the plain sweep — but
-> still one batch, run concurrently across jobs.
-
-Other common quick-look variants:
+More quick-look variants:
 
 ```bash
 ./jobstats_history                       # your jobs over the last 1 day (default)
 ./jobstats_history -N 20                 # your most recent 20 jobs
-./jobstats_history -A kempner_dev -D 7   # narrow to an account
-./jobstats_history --gpu --dcgm -D 5     # add the richer DCGM columns to the sweep
+./jobstats_history -A kempner_dev -D 7   # everyone on an account, last 7 days
+./jobstats_history -t failed -D 7        # only the jobs that failed
 ```
+
+Two of those jobs clearly deserve a closer look — that's the next tool.
 
 ---
 
@@ -104,14 +118,14 @@ Example output:
 Job 17487044  [COMPLETED]  sweep_lr   (2026-05-30 21:05 .. 05:27, 30060s)
   NODE             GPU  DUTY%   SM_ACT%   OCC%    TENSOR%   DRAM%    POWER_W
   ----------------------------------------------------------------------------
-  holygpu8a01      0    74      11.3      6.2     0.0       8.1      121
-  holygpu8a01      1    71      10.9      5.8     0.0       7.4      118
+  holygpu8a01      0    89      11.3      6.2     0.0       8.1      121
+  holygpu8a01      1    87      10.9      5.8     0.0       7.4      118
   ...
-  Overall               72      11.1      6.0     0.0       7.8      120
+  Overall               88      11.1      6.0     0.0       7.8      120
 ```
 
-This explains the low number from the quick look: `DUTY%` was ~72% (the GPU was
-*occupied* most of the time) but `SM_ACT%` was only ~11% and `TENSOR%` was 0 —
+This explains the catch from the quick look: `DUTY%` was ~88% (the GPU was
+*occupied* almost the whole run) but `SM_ACT%` was only ~11% and `TENSOR%` was 0 —
 the GPU was **resident but barely loaded** (host/input bound, tiny batches), and
 no tensor cores were used. That is the "underfed" diagnosis, with the numbers to
 back it up.
@@ -139,10 +153,11 @@ Go deeper from here:
 
 ### The two-tool workflow in one line
 
-> **Sweep with `jobstats_history` to find the jobs with poor `GPU%`/`DIAG`, then
-> profile those specific job IDs with `jobstats_dcgm` to see why.**
+> **Sweep with `jobstats_history --gpu --dcgm` to find the jobs with low
+> `SM_ACT%` / a bad `DIAG`, then profile those specific job IDs with
+> `jobstats_dcgm` to see why.**
 
-The same DCGM columns are available *inside* `jobstats_history --dcgm` for the
+The same five DCGM columns are available *inside* `jobstats_history --dcgm` for the
 quick sweep; `jobstats_dcgm` is the standalone, per-job tool with the **full**
 28-metric catalog, per-GPU rows, and time-series output.
 
@@ -171,14 +186,12 @@ exactly; running jobs may differ by ~1% (the blob is the last snapshot, while
 ./jobstats_history -A kempner_dev -D 7   # narrow to an account
 ./jobstats_history -p kempner_h100 -D 7  # narrow to a partition
 ./jobstats_history -t failed -D 7        # only failed jobs
-./jobstats_history --gpu -D 7            # GPU columns only (drops non-GPU jobs)
-./jobstats_history -d 17487020           # per-node / per-GPU breakdown for one job
+./jobstats_history --gpu --dcgm -D 5     # GPU jobs + the real DCGM utilization columns
+./jobstats_history --gpu --diagnose -D 5 # advisory DIAG verdict per job
+./jobstats_history -d --gpu --dcgm 17487020      # per-GPU breakdown incl. DCGM cols
 ./jobstats_history 17487020 17410278     # specific job IDs (bypass time selection)
-./jobstats_history --gpu --dcgm -D 7     # + time-averaged DCGM profiling columns
-./jobstats_history -d --gpu --dcgm 17487020   # per-GPU breakdown incl. DCGM cols
 ./jobstats_history --gpu --dcgm --csv -D 7 > out.csv   # CSV incl. DCGM cols
-./jobstats_history --gpu --diagnose -D 7       # advisory DIAG verdict per job
-./jobstats_history --describe                  # explain every column (no job needed)
+./jobstats_history --describe            # explain every column (no job needed)
 ```
 
 Selects your jobs (default `$USER`) over a time scope; with no scope at all it
@@ -187,60 +200,57 @@ entirely.
 
 ### Options
 
-**Positional**
+> **Tip — get help any time:** run **`./jobstats_history -h`** for the full
+> usage. The Synopsis above covers the common cases; expand the list below for
+> every flag.
 
-| Argument | Description |
+<details>
+<summary><b>Full option list</b> (click to expand)</summary>
+
+| Flag | What it does |
 |---|---|
-| `jobids` | Specific job IDs to report on. Bypasses all time selection (the `-u`/`-A`/`-p` filters are **not** applied). The header `User:` line then shows the jobs' **actual owner(s)** from `sacct`, which may differ from you. |
-
-**Selection**
-
-| Flag | Description |
-|---|---|
-| `-u, --user USER` | User whose jobs to select. **Default:** the current user (`$USER`). |
-| `-A, --account ACCOUNT` | Narrow to this account. |
-| `-p, --partition PARTITION` | Narrow to this partition. |
-| `-t, --state {all,completed,failed}` | Job-state filter. **Default:** `all`. (`completed`/`failed` default to `-D 1`.) `failed` covers `FAILED,TIMEOUT,OUT_OF_MEMORY,NODE_FAIL,CANCELLED,DEADLINE,BOOT_FAIL,PREEMPTED`. |
-
-**Time scope**
-
-| Flag | Description |
-|---|---|
+| **Who / which jobs** | |
+| `jobids` *(positional)* | Report exactly these job IDs; bypasses time selection and the `-u/-A/-p` filters. The header then shows the jobs' real owner(s) from `sacct`. |
+| `-u, --user USER` | Whose jobs to select (default: `$USER`). |
+| `-A, --account ACCT` | Narrow to an account. |
+| `-p, --partition PART` | Narrow to a partition. |
+| `-t, --state {all,completed,failed}` | State filter (default `all`; `completed`/`failed` imply `-D 1`). |
+| **Time scope** *(default: last 1 day)* | |
 | `-N, --lastn N` | The most recent **N jobs**. |
-| `-D, --days N` | Jobs in the **last N days**. |
-| `-S, --starttime TIME` | Window start (sacct format, e.g. `2026-05-26`). |
-| `-E, --endtime TIME` | Window end (sacct format). |
-
-With no scope at all, defaults to the **last 1 day**. `-D` cannot be combined
-with `-N` or with `-S/-E`.
-
-**Columns / view**
-
-| Flag | Description |
-|---|---|
-| `--cpu` | Show **CPU** columns only. |
-| `--gpu` | Show **GPU** columns only — **non-GPU jobs are dropped**. |
-| `--full` | Show **all** columns (**default**). |
-| `--dcgm` | Add time-averaged **DCGM profiling** columns (`SM_ACT% / OCC% / TENSOR% / DRAM% / POWER_W`). GPU jobs only; pulled live from the jobstats Prometheus (see Notes). |
-| `--diagnose` | Add an advisory **`DIAG`** column (`idle` / `underfed` / `low-occ` / `mem-bound` / `no-tensor` / `ok`) per job (or per GPU with `-d`). GPU jobs only; fetches the DCGM data like `--dcgm` (combine the two to show both the numbers and the verdict). Heuristic — see the DIAG legend below. |
-| `--min-runtime N` | Jobs shorter than N seconds get `DIAG=short` (**default 180**; shorter runs are sampling noise). |
-| `--workers N` | Max concurrent `--dcgm`/`--diagnose` query-sets (**default 8**). The queries are I/O-bound, so `N>1` speeds up wide selections **even on a single CPU**; `--workers 1` serializes them. |
+| `-D, --days N` | Jobs in the **last N days** (not combinable with `-N` or `-S/-E`). |
+| `-S, --starttime` / `-E, --endtime TIME` | Explicit window, sacct format (e.g. `2026-05-26`). |
+| **Which columns** *(default: `--full`)* | |
+| `--cpu` / `--gpu` / `--full` | Pick the metric set. `--gpu` shows GPU columns only and **drops non-GPU jobs**. |
+| `--dcgm` | Add DCGM columns `SM_ACT% / OCC% / TENSOR% / DRAM% / POWER_W` (GPU jobs only; queries Prometheus). |
+| `--diagnose` | Add the advisory **`DIAG`** verdict (`idle`/`underfed`/`low-occ`/`mem-bound`/`no-tensor`/`ok`). Fetches DCGM data like `--dcgm`; combine the two to show numbers *and* verdict. |
 | `-d, --details` | Per-node / per-GPU breakdown for each job. |
-
-If `--cpu`/`--gpu`/`--full` is not given and the terminal is interactive, you are
-prompted; otherwise it defaults to `--full`.
-
-**Output**
-
-| Flag | Description |
-|---|---|
+| **Tuning & output** | |
+| `--min-runtime N` | Runs shorter than N seconds get `DIAG=short` (default 180; sampling noise). |
+| `--workers N` | Concurrent `--dcgm` query-sets (default 8; the queries are I/O-bound, so `>1` helps even on one CPU; `1` serializes). |
+| `--csv` | Machine-readable output (works for the summary **and** the `-d` view). |
 | `-n, --noheader` | Suppress the header / context block. |
-| `--describe`, `--description`, `--explain` | Print a plain-English description of each column and **exit** (no job ID needed). Add `--diagnose` for the DIAG-tag legend. For the full DCGM metric set, see `jobstats_dcgm --describe --all`. |
-| `--csv` | Machine-readable output. Works for the summary **and** the `-d` detail view (detail CSV adds a leading `JOBID` column so per-GPU rows are identifiable). |
-| `--timeout SECONDS` | Seconds per `sacct` / Prometheus call (**default 60**; `0` disables). If a selection spans too many jobs, narrow it with `-N`/`-D`/`-S`/`-E` rather than raising this. |
+| `--describe` | Print a plain-English description of every column and exit (no job needed; add `--diagnose` for the DIAG legend). |
+| `--timeout S` | Seconds per `sacct` / Prometheus call (default 60; `0` disables). |
 | `-h, --help` | Show help and exit. |
 
+A few details that don't fit a one-liner:
+
+- If you pass none of `--cpu/--gpu/--full`, the tool prompts when run
+  interactively, otherwise defaults to `--full`.
+- `-t failed` covers `FAILED,TIMEOUT,OUT_OF_MEMORY,NODE_FAIL,CANCELLED,DEADLINE,BOOT_FAIL,PREEMPTED`.
+- `--describe` documents the CPU/MEM/GPU/GMEM columns plus the five DCGM columns;
+  for the full 28-metric DCGM catalog use `jobstats_dcgm --describe --all`.
+- The `-d --csv` detail view prepends a `JOBID` column so per-GPU rows are
+  identifiable.
+- If a selection spans too many jobs, narrow it with `-N`/`-D`/`-S`/`-E` rather
+  than raising `--timeout`.
+
+</details>
+
 ### Output columns
+
+<details>
+<summary><b>Column reference</b> — summary view, <code>-d</code> detail, and the <code>--dcgm</code> columns (click to expand)</summary>
 
 Summary view (`--full`):
 
@@ -278,6 +288,8 @@ SMCLK/…), use the standalone `jobstats_dcgm` tool.
 
 Jobs with no jobstats blob (`JS1:None` / `JS1:Short` / missing) print a row
 showing the real Slurm state and `(no jobstats data)`.
+
+</details>
 
 ### Notes
 
@@ -342,18 +354,27 @@ the same Prometheus but are never written to the blob; this tool exposes them.
 
 ### Options
 
-| Flag | Description |
+> **Tip — get help any time:** run **`./jobstats_dcgm -h`** for the full usage,
+> or **`./jobstats_dcgm --describe`** to explain every metric without needing a
+> job.
+
+<details>
+<summary><b>Full option list</b> (click to expand)</summary>
+
+| Flag | What it does |
 |---|---|
-| `jobids` | One or more Slurm job IDs (required, unless `--describe`). |
+| `jobids` *(positional)* | One or more Slurm job IDs (required, unless `--describe`). |
 | `--all` | Show **all 28** metrics instead of the default 6 (adds ENGINE/HMMA/IMMA/DFMA/FP16/FP32/FP64/MEMCP/PWRmax/ENERGY/FB_USED/FB_FREE/FB_RSVD/PCIE_TX/PCIE_RX/NVLINK/SMCLK/MEMCLK/TEMP/MEMTEMP/ENC/DEC). |
-| `--diagnose` | Add an advisory **`DIAG`** column (`idle` / `underfed` / `low-occ` / `mem-bound` / `no-tensor` / `ok`) derived from the default metrics; no extra queries. |
-| `--min-runtime N` | Jobs shorter than N seconds get `DIAG=short` (**default 180**). |
-| `--csv` | Machine-readable output to stdout — **one row per (job, node, GPU)**. Redirect to a file to store. Per-GPU rows are the atomic data; aggregate yourself if needed. |
-| `--timeseries`, `--ts` | Emit the **raw per-scrape time series** over each job's window as CSV (`JOBID,EPOCH,TIME,NODE,GPU,<metrics>`) instead of the window average — ideal for plotting a job's profile over time. Metrics are de-duplicated by Prometheus name. |
-| `--describe`, `--description`, `--explain` | Print a plain-English description of each metric and **exit** (no job needed; respects `--all`; add `--diagnose` for the DIAG legend). |
+| `--diagnose` | Add the advisory **`DIAG`** column (`idle`/`underfed`/`low-occ`/`mem-bound`/`no-tensor`/`ok`), derived from the default metrics; no extra queries. |
+| `--min-runtime N` | Jobs shorter than N seconds get `DIAG=short` (default 180). |
+| `--csv` | Machine-readable to stdout — **one row per (job, node, GPU)**; redirect to a file to store. |
+| `--timeseries`, `--ts` | Emit the **raw per-scrape time series** over each job's window as CSV (`JOBID,EPOCH,TIME,NODE,GPU,<metrics>`) instead of the window average — for plotting a job's profile over time. |
+| `--describe`, `--explain` | Print a plain-English description of each metric and exit (no job needed; respects `--all`; add `--diagnose` for the DIAG legend). |
 | `-n, --noheader` | Suppress the table / CSV header row. |
-| `--timeout SECONDS` | Seconds per HTTP / `sacct` call (**default 60**). |
+| `--timeout S` | Seconds per HTTP / `sacct` call (default 60). |
 | `-h, --help` | Show help and exit. |
+
+</details>
 
 ### Output
 
@@ -380,7 +401,8 @@ tensor-core workloads.
 | `DRAM%` | `DCGM_FI_PROF_DRAM_ACTIVE` | frac. time HBM interface busy (bandwidth duty cycle) |
 | `POWER_W` | `DCGM_FI_DEV_POWER_USAGE` | mean board power (W) |
 
-**Additional columns with `--all` (22)**:
+<details>
+<summary><b>Additional columns with <code>--all</code> (22)</b> (click to expand)</summary>
 
 | Column | Prometheus metric | Meaning |
 |---|---|---|
@@ -411,6 +433,8 @@ tensor-core workloads.
 > so the window-average is a mean throughput; the MB/s / MiB/s scaling assumes
 > per-second values, so treat the *absolute* bandwidth as approximate
 > (relative / zero-vs-nonzero is reliable).
+
+</details>
 
 ### Reading the metrics — diagnostic patterns
 
