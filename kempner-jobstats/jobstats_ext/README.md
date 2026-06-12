@@ -1,23 +1,16 @@
 # jobstats_extended
 
-A local, non-invasive superset of the stock `jobstats` for completed Slurm
-jobs. It subclasses `jobstats.Jobstats` (reusing all of its
-sacct/Prometheus/serialization logic) and folds extra DCGM GPU profiling
-metrics into the jobstats blob, keyed per-GPU by `minor_number` exactly like the
-built-in `gpu_utilization`.
+`jobstats_extended.py` is a drop-in wrapper around the standard Slurm
+`jobstats` report. It keeps the familiar CPU, memory, GPU utilization, and GPU
+memory sections, then adds DCGM GPU profiling metrics for completed jobs.
 
-Extra metrics added (time-averaged over the job window):
+The added DCGM metrics are averaged over the job run time and reported per GPU:
 
-- SM active (%)
-- SM occupancy (%)
-- Tensor pipe active (%)
-- DRAM active (%)
-- Power usage (W)
-
-Because the `DCGM_FI_*` series live in a different exporter and carry
-`UUID`/`gpu` rather than `minor_number`, the script maps `UUID -> (node, minor)`
-via the `nvidia_gpu_jobId` companion series, then stores each DCGM metric back
-under `minor_number` so the new keys align with `gpu_utilization` in the blob.
+- `SM_ACT%`
+- `OCC%`
+- `TENSOR%`
+- `DRAM%`
+- `POWER_W`
 
 ## Usage
 
@@ -25,7 +18,7 @@ under `minor_number` so the new keys align with `gpu_utilization` in the blob.
 ./jobstats_extended.py <job_id> [<job_id> ...] [options]
 ```
 
-## Examples
+Examples:
 
 ```bash
 ./jobstats_extended.py 18583067            # formatted report (like jobstats) + DCGM
@@ -34,7 +27,7 @@ under `minor_number` so the new keys align with `gpu_utilization` in the blob.
 ./jobstats_extended.py --no-dcgm 18583067  # report/blob without the DCGM metrics
 ```
 
-## Options
+Options:
 
 - `-j`, `--json` — emit the extended blob as pretty JSON instead of the report
 - `-b`, `--base64` — emit the `JS1:<base64 gzip JSON>` blob (AdminComment storage form)
@@ -45,14 +38,13 @@ under `minor_number` so the new keys align with `gpu_utilization` in the blob.
 - `-d`, `--debug` — debug output
 
 
-Sample output:
+## Sample output
 
 ```bash
-./jobstats_extended.py 21054500 
+./jobstats_extended.py 65867515_0
 ```
 
 ```text
- python3 jobstats_extended.py 65867515_0
 # job 65867515_0: added gpu_sm_active, gpu_sm_occupancy, gpu_tensor_active, gpu_dram_active, gpu_power_usage
 
 ================================================================================
@@ -147,9 +139,43 @@ Sample output:
       holygpu8a15602 (GPU 3): SM active=12.5%  SM occupancy=2.3%  Tensor active=2.2%  DRAM active=7.8%  Power usage=171.2W
 ```
 
+## Metric guide
+
+Standard `jobstats` already reports CPU utilization, CPU memory usage, GPU
+utilization, and GPU memory usage. `jobstats_extended.py` preserves those values
+and adds DCGM metrics that describe what the GPUs were doing internally.
+
+| Metric | Meaning | How to read it |
+| --- | --- | --- |
+| `CPU utilization` | CPU time used divided by allocated CPU runtime. | Low values usually mean the job requested more CPU cores than it used. |
+| `CPU memory usage` | Peak host memory used compared with allocated memory. | High values can indicate memory pressure; low values can indicate over-requested memory. |
+| `GPU utilization` | The standard coarse GPU busy signal. | Useful as a quick activity check, but it does not explain which GPU subsystem was busy. |
+| `GPU memory usage` | Peak device memory used compared with GPU memory capacity. | Shows memory footprint, not whether computation or memory bandwidth was the bottleneck. |
+| `SM_ACT%` | Percent of time the GPU streaming multiprocessors had active work. | Shows whether CUDA cores were actually active. |
+| `OCC%` | Average SM occupancy, or how full the SMs were while kernels ran. | Low occupancy can point to small batches, limited parallelism, register pressure, or launch/configuration limits. |
+| `TENSOR%` | Percent of time tensor cores were active. | Important for mixed-precision AI workloads; low values can mean the job is not using tensor-core-friendly kernels. |
+| `DRAM%` | Percent of time GPU memory bandwidth was active. | Helps identify memory-bound jobs, data movement overhead, and inefficient memory access patterns. |
+| `POWER_W` | Average GPU power draw in watts. | Helps distinguish real compute load from idle, stalled, or lightly loaded GPU allocation time. |
+
+The five DCGM metrics provide a better picture than `GPU utilization` alone
+because a single utilization percentage hides the reason a GPU was busy. Two jobs
+can both show `GPU utilization=50%`, while one is compute-bound, another is
+memory-bandwidth-bound, another is barely filling the SMs, and another is mostly
+idle between short kernels. `SM_ACT%`, `OCC%`, `TENSOR%`, `DRAM%`, and `POWER_W`
+separate those cases:
+
+- `SM_ACT%` shows whether the GPU compute units were active.
+- `OCC%` shows how much parallel work was available when kernels ran.
+- `TENSOR%` shows whether tensor cores contributed to the workload.
+- `DRAM%` shows whether GPU memory bandwidth was the limiting resource.
+- `POWER_W` shows whether the GPU drew power consistent with meaningful work.
+
+Together, these metrics make it easier to tell whether a job needs more GPUs,
+fewer GPUs, larger batches, better kernel efficiency, faster input pipelines, or
+different resource requests.
+
 ## Requirements
 
-Runs alongside an existing `jobstats` install: it imports `jobstats`,
-`output_formatters`, and `config` (`PROM_SERVER`) from the system path
-(`/usr/local/bin`, `/usr/bin`), plus the `requests` library.
-
+Requires an existing `jobstats` install plus the `requests` Python package. The
+script imports `jobstats`, `output_formatters`, and `config` (`PROM_SERVER`) from
+the system path (`/usr/local/bin`, `/usr/bin`).
