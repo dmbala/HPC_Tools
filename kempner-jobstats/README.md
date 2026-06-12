@@ -1,167 +1,124 @@
 # kempner-jobstats
 
-Two command-line tools for reviewing Slurm job efficiency after a job finishes.
+`kempner_jobstats` summarizes completed Kempner Slurm jobs. It reads existing
+jobstats data from `sacct`, adds DCGM GPU metrics from Prometheus when available,
+and can emit CSV for terminal plots.
 
-- `jobstats_history`: scan many jobs quickly.
-- `jobstats_dcgm`: inspect detailed GPU metrics for specific job IDs.
 
-Both tools use the same jobstats data sources, so their numbers should line up
-with `jobstats`.
+## Screenshots
 
+<table width="800">
+  <tr>
+    <td><strong>Per-job DCGM time series</strong></td>
+  </tr>
+  <tr>
+    <td><img src="docs/timeseries.svg" alt="per-job DCGM time series" width="800"></td>
+  </tr>
+  <tr>
+    <td><strong>Aggregated utilization across jobs</strong></td>
+  </tr>
+  <tr>
+    <td><img src="docs/aggregated.svg" alt="aggregated mean-utilization bars" width="800"></td>
+  </tr>
+</table>
+
+Sample output:
+
+```bash
+./kempner_jobstats -S 2026-06-01 -E 2026-06-02
+```
+
+```text
+  User:      bdesinghu
+  Select:    2026-06-01 .. 2026-06-02
+JOBID        STATE     GPUS GPU%   GMEM%   SM_ACT%  OCC%    TENSOR%  DRAM%   POWER_W  RUNTIME      NAME
+-------------------------------------------------------------------------------------------------------
+17752673     COMPLETED 1    92     6       77.1     24.9    1.5      15.0    452      02:58:26     combo-pile
+17752674     COMPLETED 1    78     38      52.3     15.3    6.9      7.8     388      00:13:34     eval-pile
+18074321     COMPLETED 1    98     8       49.3     5.8     1.0      6.6     181      01:37:53     vae-wt103
+18074323     COMPLETED 1    96     9       89.3     22.5    0.2      21.2    625      01:13:50     ar-wt103
+18074325     COMPLETED 1    0      1       0.0      0.0     0.0      0.0     104      00:04:00     cache-wt103
+18074326     COMPLETED 1    93     6       76.7     24.8    1.5      14.8    455      09:28:41     combo-wt103
+-------------------------------------------------------------------------------------------------------
+Mean:                       76     11      57.5     15.5    1.8      10.9    368
+```
 ## Quick Start
+You do not need to perform a formal installation. You can run `kempner_jobstats` using the pre-deployed cluster path or by cloning the repository directly.
 
-Start with a GPU summary for recent jobs:
-
+Using the shared cluster path:
 ```bash
-./jobstats_history --gpu --dcgm -D 5
+export JOBSTAT_PATH=/n/holylfs06/LABS/kempner_shared/Everyone/cluster_scripts/job_eff/kempner-jobstats
+
+# View efficiency for the last 3 days
+$JOBSTAT_PATH/kempner_jobstats -D 3
+
+# Plot efficiency for a specific JOBID
+$JOBSTAT_PATH/kempner_jobstats --dcgm --ts --csv <JOBID> | ./plot_util/jobstats_plot --compact
 ```
-
-This shows GPU jobs from the last 5 days and adds DCGM utilization columns.
-
-Then inspect one job in detail:
-
+Downloading the scripts:
 ```bash
-./jobstats_dcgm --all 17487044
+git clone https://github.com/KempnerInstitute/kempner-jobstats
+cd kempner-jobstats
+
+# View efficiency for the last 3 days
+./kempner_jobstats -D 3
+
+# Plot efficiency for a specific JOBID
+./kempner_jobstats --dcgm --ts --csv <JOBID> | ./plot_util/jobstats_plot --compact
 ```
+Dependencies:
+For instructions on plotting dependencies and setting up your own virtual environment, please refer to plot_util/README.md.
+For plotting dependencies, including how to use your own venv, see [`plot_util/README.md`](plot_util/README.md).
 
-Add a simple advisory label:
 
+## Common Commands
+
+See command args
 ```bash
-./jobstats_history --gpu --diagnose -D 5
-./jobstats_dcgm --diagnose 17487044
+kempner_jobstats -h
 ```
-
-## Which Tool Should I Use?
-
+Some common command need and options
 | Need | Command |
 |---|---|
-| See recent jobs | `./jobstats_history` |
-| See recent GPU jobs | `./jobstats_history --gpu -D 5` |
-| Add real GPU activity metrics | `./jobstats_history --gpu --dcgm -D 5` |
-| Grade GPU jobs with a `DIAG` tag | `./jobstats_history --gpu --diagnose -D 5` |
-| Inspect one job per GPU | `./jobstats_dcgm JOBID` |
-| Export raw GPU time series | `./jobstats_dcgm --ts JOBID > job.csv` |
+| Recent GPU jobs | `kempner_jobstats -D 3` |
+| CPU + GPU summary without Prometheus | `kempner_jobstats --cgpu -D 2` |
+| CPU-only summary | `kempner_jobstats --cpu -D 5` |
+| GPU diagnosis labels | `kempner_jobstats --diagnose -D 5` |
+| Per-node / per-GPU detail | `kempner_jobstats -d JOBID` |
+| Per-GPU DCGM table | `kempner_jobstats --dcgm --ext JOBID` |
+| Raw DCGM time series CSV | `kempner_jobstats --dcgm --ts --csv JOBID > ts.csv` |
+| Plot saved CSV | `jobstats_plot -f ts.csv --compact` |
 
-## Reading GPU Metrics
+Selectors such as `-N`, `-D`, `-S/-E`, `-u`, `-A`, `-p`, and `-t` work across
+views. Run `kempner_jobstats --help` for all options and
+`kempner_jobstats --describe` for column definitions.
 
-`GPU%` alone can be misleading. It means a kernel was running, not that the GPU
-was doing useful work.
+## Views
 
-The most useful columns are:
+- `--gpu` is the default view for GPU jobs. It includes DCGM metrics when
+  Prometheus data is available.
+- `--cgpu` and `--cpu` are offline views based only on stored jobstats data.
+- `--diagnose` adds a short GPU diagnosis label.
+- `--dcgm` shows one row per GPU. Add `--ext` for more metrics or `--ts --csv`
+  for raw time-series samples.
+- `--csv` makes any view machine-readable and pipeable to `jobstats_plot`.
 
-| Column | Meaning |
-|---|---|
-| `GPU%` / `DUTY%` | Time when at least one GPU kernel was running. Coarse signal. |
-| `SM_ACT%` | How much the GPU cores were active. Best quick efficiency signal. |
-| `OCC%` | How full the cores were. Low values often mean small kernels or weak parallelism. |
-| `TENSOR%` | Tensor-core activity. Near zero on ML training often means no mixed precision. |
-| `DRAM%` | HBM memory-bandwidth activity. High values can indicate a memory-bound job. |
-| `POWER_W` | Mean board power. Low power usually confirms the GPU was mostly idle. |
+## Plots
 
-Common patterns:
-
-| Pattern | What it looks like |
-|---|---|
-| Idle | Low `GPU%`, low `SM_ACT%`, low `POWER_W` |
-| Underfed | High `GPU%`, low `SM_ACT%`, low `OCC%` |
-| Low occupancy | High `SM_ACT%`, low `OCC%` |
-| Memory bound | High `DRAM%` relative to compute columns |
-| No tensor cores | High `SM_ACT%`, near-zero `TENSOR%` on an ML workload |
-
-## `jobstats_history`
-
-Use this to scan jobs in bulk. It reads each job's stored `sacct`
-`AdminComment` jobstats blob in one query.
-
-Common commands:
+`jobstats_plot` renders `kempner_jobstats --csv` output as terminal bars,
+histograms, heatmaps, and time-series plots.
 
 ```bash
-./jobstats_history                         # your jobs from the last 1 day
-./jobstats_history -D 7                    # your jobs from the last 7 days
-./jobstats_history -N 20                   # your 20 most recent jobs
-./jobstats_history -A kempner_dev -D 7     # account jobs from the last 7 days
-./jobstats_history -p kempner_h100 -D 7    # partition jobs from the last 7 days
-./jobstats_history -t failed -D 7          # failed jobs from the last 7 days
-./jobstats_history --gpu --dcgm -D 5       # GPU jobs with DCGM columns
-./jobstats_history --gpu --diagnose -D 5   # GPU jobs with DIAG labels
-./jobstats_history -d --gpu JOBID          # per-node / per-GPU breakdown
-./jobstats_history --csv -D 7 > jobs.csv   # CSV output
+kempner_jobstats --gpu  --csv JOBID      | ~/plot_util/jobstats_plot
+kempner_jobstats --gpu  --csv -D 3       | ~/plot_util/jobstats_plot --kind bars
+kempner_jobstats --dcgm --ts --csv JOBID | ~/plot_util/jobstats_plot --compact
 ```
 
-Useful options:
+See [`plot_util/README.md`](plot_util/README.md) for plotting setup and options.
 
-| Option | Meaning |
-|---|---|
-| `JOBID ...` | Report specific job IDs instead of selecting by time. |
-| `-u USER` | Select another user's jobs. |
-| `-A ACCOUNT` | Filter by Slurm account. |
-| `-p PARTITION` | Filter by partition. |
-| `-t STATE` | Filter by state: `all`, `completed`, or `failed`. |
-| `-D DAYS` | Select jobs from the last N days. |
-| `-N N` | Select the most recent N jobs. |
-| `-S TIME -E TIME` | Select an explicit time window. |
-| `--cpu`, `--gpu`, `--full` | Choose output columns. `--full` is the default. |
-| `--dcgm` | Add `SM_ACT%`, `OCC%`, `TENSOR%`, `DRAM%`, and `POWER_W`. |
-| `--diagnose` | Add an advisory `DIAG` label. |
-| `-d`, `--details` | Show per-node / per-GPU details. |
-| `--csv` | Print machine-readable CSV. |
-| `--describe` | Explain output columns and exit. |
-
-Run the full help at any time:
-
-```bash
-./jobstats_history --help
-```
-
-## `jobstats_dcgm`
-
-Use this after `jobstats_history` points to a job worth investigating. It shows
-time-averaged DCGM metrics per GPU.
-
-Common commands:
-
-```bash
-./jobstats_dcgm JOBID                 # default GPU metrics
-./jobstats_dcgm JOBID1 JOBID2         # several jobs
-./jobstats_dcgm --diagnose JOBID      # add DIAG labels
-./jobstats_dcgm --all JOBID           # all available metrics
-./jobstats_dcgm --csv JOBID > out.csv # one row per job/GPU
-./jobstats_dcgm --ts JOBID > ts.csv   # raw per-scrape time series
-./jobstats_dcgm --describe --all      # explain all metrics
-```
-
-Default columns:
-
-| Column | Meaning |
-|---|---|
-| `DUTY%` | Same coarse duty-cycle signal as `GPU%`. |
-| `SM_ACT%` | SM/core activity. |
-| `OCC%` | SM occupancy. |
-| `TENSOR%` | Tensor-core activity. |
-| `DRAM%` | HBM bandwidth activity. |
-| `POWER_W` | Mean board power. |
-
-Run the full help at any time:
-
-```bash
-./jobstats_dcgm --help
-```
-
-## Requirements
-
-- Run these tools on a system where `jobstats` is installed.
-- `jobstats_history` without `--dcgm` or `--diagnose` only needs `sacct`.
-- `jobstats_history --dcgm`, `jobstats_history --diagnose`, and
-  `jobstats_dcgm` query the jobstats Prometheus endpoint.
-- `jobstats_dcgm` requires at least one job ID unless you use `--describe`.
 
 ## References
 
-- FASRC jobstats documentation:
-  <https://docs.rc.fas.harvard.edu/kb/jobstats/>
-- Princeton jobstats:
-  <https://princetonuniversity.github.io/jobstats/>
-- KempnerPulse for live monitoring:
-  <https://github.com/KempnerInstitute/kempnerpulse>
-
-
+- [FASRC jobstats documentation](https://docs.rc.fas.harvard.edu/kb/jobstats/)
+- [Princeton jobstats](https://princetonuniversity.github.io/jobstats/)
+- For live monitoring, use [KempnerPulse](https://github.com/KempnerInstitute/kempnerpulse)
