@@ -171,5 +171,31 @@ def parse_smi_xml(xml_text):
     return {"driver_version": _find_text(root, "driver_version"), "gpus": gpus}
 
 
+_NVLINK_GPU_RE = re.compile(r"^GPU (\d+):")
+_NVLINK_ERR_RE = re.compile(r"Link \d+:\s*([A-Za-z ]+?):\s*(\d+)\s*$")
+
+
+def parse_nvlink(text):
+    """Parse `nvidia-smi nvlink -e` output.
+
+    Returns {gpu_index: {counter: total-across-links}}; {} when the output
+    has no per-GPU sections (no NVLink / unsupported), which callers treat
+    as n/a.
+    """
+    per_gpu = {}
+    current = None
+    for line in (text or "").splitlines():
+        header = _NVLINK_GPU_RE.match(line.strip())
+        if header:
+            current = int(header.group(1))
+            per_gpu.setdefault(current, {})
+            continue
+        err = _NVLINK_ERR_RE.search(line)
+        if err and current is not None:
+            key = err.group(1).strip().lower().replace(" ", "_")
+            per_gpu[current][key] = per_gpu[current].get(key, 0) + int(err.group(2))
+    return per_gpu
+
+
 if __name__ == "__main__":
     sys.exit(0)  # replaced by main() in a later task

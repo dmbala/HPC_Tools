@@ -73,5 +73,26 @@ class TestParseSmiXml(unittest.TestCase):
             gh.parse_smi_xml("<nvidia_smi_log></nvidia_smi_log>")
 
 
+class TestParseNvlink(unittest.TestCase):
+    def test_healthy_capture(self):
+        per_gpu = gh.parse_nvlink(fixture("healthy.xml.nvlink"))
+        self.assertEqual(sorted(per_gpu), [0, 1])
+        self.assertEqual(per_gpu[0], {"replay_errors": 0,
+                                      "recovery_errors": 0,
+                                      "crc_errors": 0})
+
+    def test_sums_across_links(self):
+        text = fixture("healthy.xml.nvlink").replace(
+            "Link 1: CRC Errors: 0", "Link 1: CRC Errors: 7", 1)
+        per_gpu = gh.parse_nvlink(text)
+        self.assertEqual(per_gpu[0]["crc_errors"], 7)
+        self.assertEqual(per_gpu[1]["crc_errors"], 0)
+
+    def test_unsupported_output_is_empty(self):
+        self.assertEqual(gh.parse_nvlink(""), {})
+        self.assertEqual(
+            gh.parse_nvlink("NVLink is not supported on this device\n"), {})
+
+
 if __name__ == "__main__":
     unittest.main()
