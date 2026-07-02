@@ -238,7 +238,12 @@ def evaluate(gpu, nvlink):
         checks["ecc"] = (WARN, "volatile correctable ECC errors: %d (> %d)"
                          % (gpu["volatile_correctable"], CORRECTABLE_ECC_WARN))
     else:
-        checks["ecc"] = (OK, "")
+        counter_fields = ("volatile_uncorrectable", "aggregate_uncorrectable",
+                          "volatile_correctable")
+        if all(gpu.get(f) is None for f in counter_fields):
+            checks["ecc"] = (OK, "(ECC counters not reported)")
+        else:
+            checks["ecc"] = (OK, "")
 
     # Throttling
     throttle = gpu.get("throttle")
@@ -301,7 +306,10 @@ def build_result(parsed, nvlink_by_gpu, host=None, timestamp=None):
     for gpu in parsed["gpus"]:
         nvlink = None
         if nvlink_by_gpu is not None:
-            nvlink = nvlink_by_gpu.get(gpu["index"], {})
+            # an empty per-GPU dict means the counters were not actually
+            # parsed (unrecognized layout / GPU absent from nvlink output);
+            # that is n/a, not a clean OK
+            nvlink = nvlink_by_gpu.get(gpu["index"]) or None
         checks = evaluate(gpu, nvlink)
         gpus_out.append({
             "index": gpu["index"],
@@ -451,8 +459,13 @@ def main(argv=None):
         if args.json == "-":
             sys.stdout.write(payload)
         else:
-            with open(args.json, "w") as fh:
-                fh.write(payload)
+            try:
+                with open(args.json, "w") as fh:
+                    fh.write(payload)
+            except OSError as exc:
+                sys.stderr.write("gpu_health: error: cannot write %s: %s\n"
+                                 % (args.json, exc))
+                return EXIT_ERROR
     else:
         print(render_text(result))
     return _EXIT_FOR[result["verdict"]]

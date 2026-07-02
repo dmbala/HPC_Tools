@@ -169,6 +169,11 @@ class TestEvaluate(unittest.TestCase):
         gpu["throttle"]["sw_thermal"] = True
         self.assertEqual(self.tiers(gpu)["throttle"], gh.WARN)
 
+    def test_hw_thermal_throttle_warns(self):
+        gpu = healthy_gpu()
+        gpu["throttle"]["hw_thermal"] = True
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.WARN)
+
     def test_temp_near_slowdown_warns(self):
         gpu = healthy_gpu(temp_c=92 - gh.TEMP_MARGIN_C, slowdown_temp_c=92)
         self.assertEqual(self.tiers(gpu)["throttle"], gh.WARN)
@@ -209,6 +214,14 @@ class TestEvaluate(unittest.TestCase):
 
     def test_pcie_unreported_is_na(self):
         self.assertEqual(self.tiers(healthy_gpu(pcie_replay=None))["pcie"], gh.NA)
+
+    def test_ecc_counters_unreported_noted(self):
+        gpu = healthy_gpu(volatile_correctable=None,
+                          volatile_uncorrectable=None,
+                          aggregate_uncorrectable=None)
+        checks = gh.evaluate(gpu, NO_NVLINK_ERRORS)
+        self.assertEqual(checks["ecc"][0], gh.OK)
+        self.assertIn("not reported", checks["ecc"][1])
 
 
 class TestWorst(unittest.TestCase):
@@ -269,6 +282,16 @@ class TestBuildResult(unittest.TestCase):
         for gpu in result["gpus"]:
             self.assertEqual(gpu["checks"]["nvlink"]["status"], gh.NA)
         self.assertEqual(result["verdict"], gh.OK)  # n/a never worsens
+
+    def test_header_only_nvlink_is_na(self):
+        # GPU headers matched but no counter lines parsed -> {} per GPU,
+        # which must degrade to n/a, never OK
+        parsed = gh.parse_smi_xml(fixture("healthy.xml"))
+        nvlink = gh.parse_nvlink("GPU 0: NVIDIA H100 (UUID: GPU-x)\n"
+                                 "GPU 1: NVIDIA H100 (UUID: GPU-y)\n")
+        result = gh.build_result(parsed, nvlink, host="h", timestamp="t")
+        for gpu in result["gpus"]:
+            self.assertEqual(gpu["checks"]["nvlink"]["status"], gh.NA)
 
     def test_row_remap_states(self):
         parsed = gh.parse_smi_xml(fixture("healthy.xml").replace(
@@ -397,6 +420,13 @@ class TestCli(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(out.name) as fh:
             self.assertEqual(_json.load(fh)["verdict"], "OK")
+
+    def test_json_unwritable_path_exits_3(self):
+        proc = run_cli("--from-xml",
+                       os.path.join(FIXTURES, "healthy.xml"),
+                       "--json", "/nonexistent-dir/out.json")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
 
     def test_ecc_disabled_is_ok_with_na(self):
         proc = run_cli("--from-xml",
