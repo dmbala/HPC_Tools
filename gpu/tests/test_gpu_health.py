@@ -280,5 +280,39 @@ class TestBuildResult(unittest.TestCase):
         self.assertEqual(result["gpus"][0]["verdict"], gh.FAIL)
 
 
+class TestRender(unittest.TestCase):
+    def result(self, doctor=None):
+        xml = fixture("healthy.xml")
+        if doctor:
+            xml = doctor(xml)
+        parsed = gh.parse_smi_xml(xml)
+        nvlink = gh.parse_nvlink(fixture("healthy.xml.nvlink"))
+        return gh.build_result(parsed, nvlink, host="testhost",
+                               timestamp="2026-07-02T10:00:00")
+
+    def test_text_healthy(self):
+        text = gh.render_text(self.result())
+        self.assertIn("GPU 0: NVIDIA H100 80GB HBM3", text)
+        self.assertIn("GPU 1:", text)
+        self.assertTrue(text.rstrip().endswith("node verdict: OK"),
+                        msg=text)
+
+    def test_text_names_failing_gpu(self):
+        def doctor(xml):
+            return xml.replace(
+                "<remapped_row_failure>No</remapped_row_failure>",
+                "<remapped_row_failure>Yes</remapped_row_failure>", 1)
+        text = gh.render_text(self.result(doctor))
+        self.assertIn("row remap failure", text)
+        self.assertTrue(text.rstrip().endswith("node verdict: FAIL (GPU 0)"),
+                        msg=text)
+
+    def test_json_round_trips(self):
+        result = self.result()
+        parsed_back = __import__("json").loads(gh.render_json(result))
+        self.assertEqual(parsed_back, result)
+        self.assertTrue(gh.render_json(result).endswith("\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

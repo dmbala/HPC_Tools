@@ -348,5 +348,36 @@ def build_result(parsed, nvlink_by_gpu, host=None, timestamp=None):
     }
 
 
+def render_text(result):
+    """Plain-text report: header, one block per GPU, node verdict line."""
+    lines = ["gpu_health @ %s  (driver %s, %s)"
+             % (result["host"], result["driver_version"] or NA,
+                result["timestamp"]),
+             ""]
+    for gpu in result["gpus"]:
+        lines.append("GPU %s: %s  (serial %s)"
+                     % (gpu["index"], gpu["name"] or "?", gpu["serial"] or NA))
+        for name in ("ecc", "throttle", "pcie", "nvlink"):
+            check = gpu["checks"][name]
+            line = "  %-9s %s" % (name + ":", check["status"])
+            if check["detail"]:
+                line += " - " + check["detail"]
+            lines.append(line)
+        lines.append("  verdict:  %s" % gpu["verdict"])
+        lines.append("")
+    verdict = result["verdict"]
+    suffix = ""
+    if verdict != OK:
+        culprits = [str(g["index"]) for g in result["gpus"]
+                    if g["verdict"] == verdict]
+        suffix = " (GPU %s)" % ", GPU ".join(culprits)
+    lines.append("node verdict: %s%s" % (verdict, suffix))
+    return "\n".join(lines)
+
+
+def render_json(result):
+    return json.dumps(result, indent=2) + "\n"
+
+
 if __name__ == "__main__":
     sys.exit(0)  # replaced by main() in a later task
