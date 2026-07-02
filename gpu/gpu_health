@@ -197,5 +197,89 @@ def parse_nvlink(text):
     return per_gpu
 
 
+def worst(tiers):
+    """Worst tier in an iterable. NA never worsens a verdict; OK if empty."""
+    result = OK
+    for tier in tiers:
+        if _SEVERITY.get(tier, 0) > _SEVERITY[result]:
+            result = tier
+    return result
+
+
+def evaluate(gpu, nvlink):
+    """Verdict rules from the spec: {check: (tier, detail)} for one GPU.
+
+    `nvlink` is this GPU's counter dict from parse_nvlink, or None when
+    NVLink data is unavailable (n/a).
+    """
+    checks = {}
+
+    # ECC & row remap
+    ecc_fields = ("volatile_uncorrectable", "aggregate_uncorrectable",
+                  "volatile_correctable", "row_remap_pending",
+                  "row_remap_failure", "retired_pages_pending")
+    if gpu.get("ecc_enabled") is False:
+        checks["ecc"] = (NA, "ECC disabled")
+    elif all(gpu.get(f) is None for f in ecc_fields):
+        checks["ecc"] = (NA, "not reported")
+    elif gpu.get("volatile_uncorrectable"):
+        checks["ecc"] = (FAIL, "volatile uncorrectable ECC errors: %d"
+                         % gpu["volatile_uncorrectable"])
+    elif gpu.get("row_remap_failure"):
+        checks["ecc"] = (FAIL, "row remap failure (RMA candidate)")
+    elif gpu.get("row_remap_pending"):
+        checks["ecc"] = (FAIL, "row remap pending (GPU reset required)")
+    elif gpu.get("retired_pages_pending"):
+        checks["ecc"] = (FAIL, "retired pages pending (GPU reset required)")
+    elif gpu.get("aggregate_uncorrectable"):
+        checks["ecc"] = (WARN, "lifetime uncorrectable ECC errors: %d"
+                         % gpu["aggregate_uncorrectable"])
+    elif (gpu.get("volatile_correctable") or 0) > CORRECTABLE_ECC_WARN:
+        checks["ecc"] = (WARN, "volatile correctable ECC errors: %d (> %d)"
+                         % (gpu["volatile_correctable"], CORRECTABLE_ECC_WARN))
+    else:
+        checks["ecc"] = (OK, "")
+
+    # Throttling
+    throttle = gpu.get("throttle")
+    temp, slowdown = gpu.get("temp_c"), gpu.get("slowdown_temp_c")
+    active = sorted(k for k, v in (throttle or {}).items() if v)
+    if throttle is None and temp is None:
+        checks["throttle"] = (NA, "not reported")
+    elif "hw_slowdown" in active:
+        checks["throttle"] = (FAIL, "HW slowdown throttle active")
+    elif active:
+        checks["throttle"] = (WARN, "throttling active: %s" % ", ".join(active))
+    elif (temp is not None and slowdown is not None
+          and temp >= slowdown - TEMP_MARGIN_C):
+        checks["throttle"] = (WARN,
+                              "temperature %dC within %dC of slowdown "
+                              "threshold %dC" % (temp, TEMP_MARGIN_C, slowdown))
+    else:
+        checks["throttle"] = (OK, "")
+
+    # PCIe
+    replay = gpu.get("pcie_replay")
+    if replay is None:
+        checks["pcie"] = (NA, "not reported")
+    elif replay > 0:
+        checks["pcie"] = (WARN, "PCIe replay counter: %d" % replay)
+    else:
+        checks["pcie"] = (OK, "")
+
+    # NVLink
+    if nvlink is None:
+        checks["nvlink"] = (NA, "no NVLink data")
+    else:
+        nonzero = {k: v for k, v in nvlink.items() if v}
+        if nonzero:
+            checks["nvlink"] = (WARN, "NVLink errors: %s" % ", ".join(
+                "%s=%d" % item for item in sorted(nonzero.items())))
+        else:
+            checks["nvlink"] = (OK, "")
+
+    return checks
+
+
 if __name__ == "__main__":
     sys.exit(0)  # replaced by main() in a later task

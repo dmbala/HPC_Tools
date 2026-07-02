@@ -94,5 +94,134 @@ class TestParseNvlink(unittest.TestCase):
             gh.parse_nvlink("NVLink is not supported on this device\n"), {})
 
 
+def healthy_gpu(**overrides):
+    gpu = {
+        "index": 0, "name": "NVIDIA H100", "serial": "1650000000001",
+        "ecc_enabled": True,
+        "volatile_correctable": 0, "volatile_uncorrectable": 0,
+        "aggregate_uncorrectable": 0,
+        "row_remap_pending": False, "row_remap_failure": False,
+        "retired_pages_pending": None,
+        "throttle": {"sw_power_cap": False, "sw_thermal": False,
+                     "hw_thermal": False, "hw_slowdown": False},
+        "temp_c": 40, "slowdown_temp_c": 92,
+        "power_w": 100.0, "power_limit_w": 700.0,
+        "pcie_replay": 0,
+    }
+    gpu.update(overrides)
+    return gpu
+
+
+NO_NVLINK_ERRORS = {"replay_errors": 0, "recovery_errors": 0, "crc_errors": 0}
+
+
+class TestEvaluate(unittest.TestCase):
+    def tiers(self, gpu, nvlink=NO_NVLINK_ERRORS):
+        return {k: v[0] for k, v in gh.evaluate(gpu, nvlink).items()}
+
+    def test_all_ok(self):
+        self.assertEqual(self.tiers(healthy_gpu()),
+                         {"ecc": gh.OK, "throttle": gh.OK,
+                          "pcie": gh.OK, "nvlink": gh.OK})
+
+    # --- FAIL rules ---
+    def test_volatile_uncorrectable_fails(self):
+        self.assertEqual(
+            self.tiers(healthy_gpu(volatile_uncorrectable=1))["ecc"], gh.FAIL)
+
+    def test_row_remap_pending_fails(self):
+        self.assertEqual(
+            self.tiers(healthy_gpu(row_remap_pending=True))["ecc"], gh.FAIL)
+
+    def test_row_remap_failure_fails(self):
+        self.assertEqual(
+            self.tiers(healthy_gpu(row_remap_failure=True))["ecc"], gh.FAIL)
+
+    def test_retired_pages_pending_fails(self):
+        self.assertEqual(
+            self.tiers(healthy_gpu(retired_pages_pending=True))["ecc"], gh.FAIL)
+
+    def test_hw_slowdown_fails(self):
+        gpu = healthy_gpu()
+        gpu["throttle"]["hw_slowdown"] = True
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.FAIL)
+
+    # --- WARN rules ---
+    def test_aggregate_uncorrectable_warns(self):
+        self.assertEqual(
+            self.tiers(healthy_gpu(aggregate_uncorrectable=2))["ecc"], gh.WARN)
+
+    def test_correctable_over_threshold_warns(self):
+        gpu = healthy_gpu(volatile_correctable=gh.CORRECTABLE_ECC_WARN + 1)
+        self.assertEqual(self.tiers(gpu)["ecc"], gh.WARN)
+
+    def test_correctable_at_threshold_ok(self):
+        gpu = healthy_gpu(volatile_correctable=gh.CORRECTABLE_ECC_WARN)
+        self.assertEqual(self.tiers(gpu)["ecc"], gh.OK)
+
+    def test_power_cap_throttle_warns(self):
+        gpu = healthy_gpu()
+        gpu["throttle"]["sw_power_cap"] = True
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.WARN)
+
+    def test_thermal_throttle_warns(self):
+        gpu = healthy_gpu()
+        gpu["throttle"]["sw_thermal"] = True
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.WARN)
+
+    def test_temp_near_slowdown_warns(self):
+        gpu = healthy_gpu(temp_c=92 - gh.TEMP_MARGIN_C, slowdown_temp_c=92)
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.WARN)
+
+    def test_temp_below_margin_ok(self):
+        gpu = healthy_gpu(temp_c=92 - gh.TEMP_MARGIN_C - 1, slowdown_temp_c=92)
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.OK)
+
+    def test_pcie_replay_warns(self):
+        self.assertEqual(self.tiers(healthy_gpu(pcie_replay=4))["pcie"], gh.WARN)
+
+    def test_nvlink_errors_warn(self):
+        tiers = self.tiers(healthy_gpu(), nvlink={"crc_errors": 3})
+        self.assertEqual(tiers["nvlink"], gh.WARN)
+
+    # --- n/a rules: absent capability never affects the verdict ---
+    def test_ecc_disabled_is_na(self):
+        gpu = healthy_gpu(ecc_enabled=False, volatile_correctable=None,
+                          volatile_uncorrectable=None,
+                          aggregate_uncorrectable=None,
+                          row_remap_pending=None, row_remap_failure=None)
+        self.assertEqual(self.tiers(gpu)["ecc"], gh.NA)
+
+    def test_ecc_unreported_is_na(self):
+        gpu = healthy_gpu(ecc_enabled=None, volatile_correctable=None,
+                          volatile_uncorrectable=None,
+                          aggregate_uncorrectable=None,
+                          row_remap_pending=None, row_remap_failure=None,
+                          retired_pages_pending=None)
+        self.assertEqual(self.tiers(gpu)["ecc"], gh.NA)
+
+    def test_no_nvlink_is_na(self):
+        self.assertEqual(self.tiers(healthy_gpu(), nvlink=None)["nvlink"], gh.NA)
+
+    def test_no_throttle_data_is_na(self):
+        gpu = healthy_gpu(throttle=None, temp_c=None, slowdown_temp_c=None)
+        self.assertEqual(self.tiers(gpu)["throttle"], gh.NA)
+
+    def test_pcie_unreported_is_na(self):
+        self.assertEqual(self.tiers(healthy_gpu(pcie_replay=None))["pcie"], gh.NA)
+
+
+class TestWorst(unittest.TestCase):
+    def test_ordering(self):
+        self.assertEqual(gh.worst([gh.OK, gh.WARN, gh.FAIL]), gh.FAIL)
+        self.assertEqual(gh.worst([gh.OK, gh.WARN]), gh.WARN)
+        self.assertEqual(gh.worst([gh.OK, gh.OK]), gh.OK)
+
+    def test_na_never_worsens(self):
+        self.assertEqual(gh.worst([gh.NA, gh.OK]), gh.OK)
+        self.assertEqual(gh.worst([gh.NA]), gh.OK)
+        self.assertEqual(gh.worst([]), gh.OK)
+
+
 if __name__ == "__main__":
     unittest.main()
