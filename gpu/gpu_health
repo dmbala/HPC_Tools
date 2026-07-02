@@ -379,5 +379,84 @@ def render_json(result):
     return json.dumps(result, indent=2) + "\n"
 
 
+def _run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          universal_newlines=True, timeout=60)
+
+
+def collect():
+    """Run nvidia-smi. Returns (xml_text, nvlink_text_or_None).
+
+    Raises RuntimeError when the probe itself cannot run (exit 3 upstream).
+    A failing `nvidia-smi nvlink` only degrades NVLink to n/a.
+    """
+    try:
+        smi = _run(["nvidia-smi", "-q", "-x"])
+    except OSError:
+        raise RuntimeError("nvidia-smi not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("nvidia-smi -q -x timed out")
+    if smi.returncode != 0:
+        raise RuntimeError("nvidia-smi -q -x failed: %s"
+                           % (smi.stderr.strip() or "exit %d" % smi.returncode))
+    try:
+        nvl = _run(["nvidia-smi", "nvlink", "-e"])
+        nvlink_text = nvl.stdout if nvl.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        nvlink_text = None
+    return smi.stdout, nvlink_text
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="gpu_health",
+        description="node-local, read-only GPU health probe "
+                    "(ECC/row-remap, throttling, PCIe/NVLink errors); "
+                    "exit 0 OK, 1 WARN, 2 FAIL, 3 probe error")
+    parser.add_argument("--json", nargs="?", const="-", default=None,
+                        metavar="FILE",
+                        help="emit a JSON snapshot to FILE (stdout when "
+                             "FILE omitted) instead of the report")
+    parser.add_argument("--from-xml", metavar="FILE",
+                        help="replay a captured `nvidia-smi -q -x` dump; "
+                             "NVLink counters are read from FILE.nvlink "
+                             "when present")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.from_xml:
+            with open(args.from_xml) as fh:
+                xml_text = fh.read()
+            nvlink_text = None
+            companion = args.from_xml + ".nvlink"
+            if os.path.exists(companion):
+                with open(companion) as fh:
+                    nvlink_text = fh.read()
+        else:
+            xml_text, nvlink_text = collect()
+        parsed = parse_smi_xml(xml_text)
+    except (RuntimeError, ValueError, OSError) as exc:
+        sys.stderr.write("gpu_health: error: %s\n" % exc)
+        return EXIT_ERROR
+
+    nvlink_by_gpu = parse_nvlink(nvlink_text) if nvlink_text else {}
+    if not nvlink_by_gpu:
+        nvlink_by_gpu = None   # unsupported/absent NVLink -> n/a, not OK
+
+    result = build_result(parsed, nvlink_by_gpu)
+
+    if args.json is not None:
+        payload = render_json(result)
+        if args.json == "-":
+            sys.stdout.write(payload)
+        else:
+            with open(args.json, "w") as fh:
+                fh.write(payload)
+    else:
+        print(render_text(result))
+    return _EXIT_FOR[result["verdict"]]
+
+
 if __name__ == "__main__":
-    sys.exit(0)  # replaced by main() in a later task
+    sys.exit(main())

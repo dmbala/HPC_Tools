@@ -314,5 +314,97 @@ class TestRender(unittest.TestCase):
         self.assertTrue(gh.render_json(result).endswith("\n"))
 
 
+import json as _json
+import subprocess
+import sys
+import tempfile
+
+
+def run_cli(*argv, **kwargs):
+    return subprocess.run([sys.executable, TOOL] + list(argv),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True, **kwargs)
+
+
+class TestCli(unittest.TestCase):
+    def doctored_file(self, old, new):
+        """healthy.xml with one string replaced, in a temp file (no .nvlink
+        companion, so NVLink reports n/a)."""
+        xml = fixture("healthy.xml").replace(old, new, 1)
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".xml",
+                                          delete=False)
+        self.addCleanup(os.unlink, tmp.name)
+        tmp.write(xml)
+        tmp.close()
+        return tmp.name
+
+    def test_healthy_exits_0(self):
+        proc = run_cli("--from-xml",
+                       os.path.join(FIXTURES, "healthy.xml"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("node verdict: OK", proc.stdout)
+
+    def test_warn_exits_1(self):
+        path = self.doctored_file(
+            "<clocks_throttle_reason_sw_power_cap>Not Active",
+            "<clocks_throttle_reason_sw_power_cap>Active")
+        proc = run_cli("--from-xml", path)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("node verdict: WARN", proc.stdout)
+
+    def test_fail_exits_2(self):
+        path = self.doctored_file(
+            "<dram_uncorrectable>0</dram_uncorrectable>",
+            "<dram_uncorrectable>3</dram_uncorrectable>")
+        proc = run_cli("--from-xml", path)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("node verdict: FAIL (GPU 0)", proc.stdout)
+
+    def test_garbled_exits_3(self):
+        proc = run_cli("--from-xml",
+                       os.path.join(FIXTURES, "garbled.xml"))
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
+
+    def test_missing_from_xml_file_exits_3(self):
+        proc = run_cli("--from-xml", "/nonexistent/capture.xml")
+        self.assertEqual(proc.returncode, 3)
+
+    def test_missing_nvidia_smi_exits_3(self):
+        env = dict(os.environ, PATH="/nonexistent")
+        proc = run_cli(env=env)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("nvidia-smi", proc.stderr)
+
+    def test_json_stdout(self):
+        proc = run_cli("--from-xml",
+                       os.path.join(FIXTURES, "healthy.xml"), "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        snapshot = _json.loads(proc.stdout)
+        self.assertEqual(snapshot["verdict"], "OK")
+        self.assertEqual(len(snapshot["gpus"]), 2)
+        # companion healthy.xml.nvlink was picked up automatically
+        self.assertEqual(snapshot["gpus"][0]["checks"]["nvlink"]["status"],
+                         "OK")
+
+    def test_json_to_file(self):
+        out = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        out.close()
+        self.addCleanup(os.unlink, out.name)
+        proc = run_cli("--from-xml",
+                       os.path.join(FIXTURES, "healthy.xml"),
+                       "--json", out.name)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out.name) as fh:
+            self.assertEqual(_json.load(fh)["verdict"], "OK")
+
+    def test_ecc_disabled_is_ok_with_na(self):
+        proc = run_cli("--from-xml",
+                       os.path.join(FIXTURES, "ecc_disabled.xml"))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("ecc:      n/a", proc.stdout)
+        self.assertIn("nvlink:   n/a", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
