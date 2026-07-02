@@ -14,6 +14,31 @@ the jobstats `config` module (`PROM_SERVER`), so these must run where the
 > itself** and talks to `nvidia-smi` directly — no Prometheus, no jobstats
 > modules, Python 3 stdlib only.
 
+### Running `gpu_health` on a GPU node via Slurm
+
+If you are not already on the node, run it through Slurm (the repo lives on a
+shared filesystem, so the node runs it in place):
+
+```bash
+# quick interactive check on one GPU
+srun -A <account> -p <gpu-partition> --gres=gpu:1 -c 2 --mem=8G -t 10 ./gpu/gpu_health
+
+# check ALL GPUs on a node (Slurm cgroups hide unallocated GPUs, so
+# request the whole node's GPUs; add -w <node> to target a specific node)
+srun -A <account> -p <gpu-partition> --gres=gpu:4 -c 2 --mem=8G -t 10 -w <node> ./gpu/gpu_health
+
+# JSON snapshot for archiving / diffing
+srun -A <account> -p <gpu-partition> --gres=gpu:1 -c 2 --mem=8G -t 10 \
+    ./gpu/gpu_health --json results/gpu_health_$(date +%Y%m%d).json
+
+# Kempner example (as tested: H200 node on kempner_eng)
+srun -A kempner_dev -p kempner_eng --gres=gpu:1 -c 2 --mem=8G -t 10 ./gpu/gpu_health
+```
+
+The exit code passes through Slurm, so `srun ... ./gpu/gpu_health && echo healthy`
+works as a scriptable gate (0 OK, 1 WARN, 2 FAIL, 3 probe error). You can also
+`ssh` to a node where you have a running job and invoke it directly.
+
 ## See also
 
 For a **per-job GPU% / GPU-memory% summary** (coarse duty-cycle from the sacct
