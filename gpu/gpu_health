@@ -281,5 +281,72 @@ def evaluate(gpu, nvlink):
     return checks
 
 
+def _row_remap_state(gpu):
+    if gpu["row_remap_failure"] is None and gpu["row_remap_pending"] is None:
+        return NA
+    if gpu["row_remap_failure"]:
+        return "failure"
+    if gpu["row_remap_pending"]:
+        return "pending"
+    return "none"
+
+
+def build_result(parsed, nvlink_by_gpu, host=None, timestamp=None):
+    """Assemble the snapshot dict (the --json schema).
+
+    nvlink_by_gpu: parse_nvlink() output, or None when NVLink data is
+    entirely unavailable. host/timestamp parameters exist for tests.
+    """
+    gpus_out = []
+    for gpu in parsed["gpus"]:
+        nvlink = None
+        if nvlink_by_gpu is not None:
+            nvlink = nvlink_by_gpu.get(gpu["index"], {})
+        checks = evaluate(gpu, nvlink)
+        gpus_out.append({
+            "index": gpu["index"],
+            "name": gpu["name"],
+            "serial": gpu["serial"],
+            "verdict": worst(tier for tier, _ in checks.values()),
+            "checks": {
+                "ecc": {
+                    "status": checks["ecc"][0],
+                    "detail": checks["ecc"][1],
+                    "volatile_uncorrectable": gpu["volatile_uncorrectable"],
+                    "aggregate_uncorrectable": gpu["aggregate_uncorrectable"],
+                    "volatile_correctable": gpu["volatile_correctable"],
+                    "row_remap": _row_remap_state(gpu),
+                },
+                "throttle": {
+                    "status": checks["throttle"][0],
+                    "detail": checks["throttle"][1],
+                    "active": sorted(
+                        k for k, v in (gpu["throttle"] or {}).items() if v),
+                    "temp_c": gpu["temp_c"],
+                    "slowdown_temp_c": gpu["slowdown_temp_c"],
+                    "power_w": gpu["power_w"],
+                    "power_limit_w": gpu["power_limit_w"],
+                },
+                "pcie": {
+                    "status": checks["pcie"][0],
+                    "detail": checks["pcie"][1],
+                    "replay_counter": gpu["pcie_replay"],
+                },
+                "nvlink": {
+                    "status": checks["nvlink"][0],
+                    "detail": checks["nvlink"][1],
+                    "errors": {k: v for k, v in (nvlink or {}).items() if v},
+                },
+            },
+        })
+    return {
+        "host": host or socket.gethostname().split(".")[0],
+        "timestamp": timestamp or datetime.now().isoformat(timespec="seconds"),
+        "driver_version": parsed["driver_version"],
+        "verdict": worst(g["verdict"] for g in gpus_out),
+        "gpus": gpus_out,
+    }
+
+
 if __name__ == "__main__":
     sys.exit(0)  # replaced by main() in a later task

@@ -223,5 +223,62 @@ class TestWorst(unittest.TestCase):
         self.assertEqual(gh.worst([]), gh.OK)
 
 
+class TestBuildResult(unittest.TestCase):
+    def build_healthy(self):
+        parsed = gh.parse_smi_xml(fixture("healthy.xml"))
+        nvlink = gh.parse_nvlink(fixture("healthy.xml.nvlink"))
+        return gh.build_result(parsed, nvlink, host="testhost",
+                               timestamp="2026-07-02T10:00:00")
+
+    def test_healthy_snapshot(self):
+        result = self.build_healthy()
+        self.assertEqual(result["host"], "testhost")
+        self.assertEqual(result["timestamp"], "2026-07-02T10:00:00")
+        self.assertEqual(result["driver_version"], "550.54.15")
+        self.assertEqual(result["verdict"], gh.OK)
+        self.assertEqual(len(result["gpus"]), 2)
+        g0 = result["gpus"][0]
+        self.assertEqual(g0["verdict"], gh.OK)
+        self.assertEqual(sorted(g0["checks"]),
+                         ["ecc", "nvlink", "pcie", "throttle"])
+        self.assertEqual(g0["checks"]["ecc"]["row_remap"], "none")
+        self.assertEqual(g0["checks"]["nvlink"]["errors"], {})
+        self.assertEqual(g0["checks"]["throttle"]["active"], [])
+
+    def test_node_verdict_is_worst_gpu(self):
+        xml = fixture("healthy.xml")
+        # doctor GPU 1 (second occurrence) to a FAIL: volatile uncorrectable
+        first = xml.find("<dram_uncorrectable>0</dram_uncorrectable>")
+        second = xml.find("<dram_uncorrectable>0</dram_uncorrectable>",
+                          first + 1)
+        # occurrences per GPU: volatile then aggregate; GPU 1 volatile is 3rd
+        third = xml.find("<dram_uncorrectable>0</dram_uncorrectable>",
+                         second + 1)
+        xml = (xml[:third]
+               + "<dram_uncorrectable>5</dram_uncorrectable>"
+               + xml[third + len("<dram_uncorrectable>0</dram_uncorrectable>"):])
+        parsed = gh.parse_smi_xml(xml)
+        result = gh.build_result(parsed, None, host="h", timestamp="t")
+        self.assertEqual(result["gpus"][0]["verdict"], gh.OK)
+        self.assertEqual(result["gpus"][1]["verdict"], gh.FAIL)
+        self.assertEqual(result["verdict"], gh.FAIL)
+
+    def test_nvlink_none_is_na_everywhere(self):
+        parsed = gh.parse_smi_xml(fixture("healthy.xml"))
+        result = gh.build_result(parsed, None, host="h", timestamp="t")
+        for gpu in result["gpus"]:
+            self.assertEqual(gpu["checks"]["nvlink"]["status"], gh.NA)
+        self.assertEqual(result["verdict"], gh.OK)  # n/a never worsens
+
+    def test_row_remap_states(self):
+        parsed = gh.parse_smi_xml(fixture("healthy.xml").replace(
+            "<remapped_row_pending>No</remapped_row_pending>",
+            "<remapped_row_pending>Yes</remapped_row_pending>", 1))
+        result = gh.build_result(parsed, None, host="h", timestamp="t")
+        self.assertEqual(result["gpus"][0]["checks"]["ecc"]["row_remap"],
+                         "pending")
+        self.assertEqual(result["gpus"][0]["verdict"], gh.FAIL)
+
+
 if __name__ == "__main__":
     unittest.main()
