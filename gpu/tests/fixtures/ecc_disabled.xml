@@ -1,0 +1,31 @@
+<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <driver_version>535.104.05</driver_version>
+  <attached_gpus>1</attached_gpus>
+  <gpu id="00000000:65:00.0">
+    <product_name>NVIDIA GeForce RTX 4090</product_name>
+    <serial>N/A</serial>
+    <minor_number>0</minor_number>
+    <ecc_mode>
+      <current_ecc>Disabled</current_ecc>
+      <pending_ecc>Disabled</pending_ecc>
+    </ecc_mode>
+    <temperature>
+      <gpu_temp>35 C</gpu_temp>
+      <gpu_temp_slow_threshold>N/A</gpu_temp_slow_threshold>
+    </temperature>
+    <clocks_throttle_reasons>
+      <clocks_throttle_reason_sw_power_cap>Not Active</clocks_throttle_reason_sw_power_cap>
+      <clocks_throttle_reason_sw_thermal_slowdown>Not Active</clocks_throttle_reason_sw_thermal_slowdown>
+      <clocks_throttle_reason_hw_thermal_slowdown>Not Active</clocks_throttle_reason_hw_thermal_slowdown>
+      <clocks_throttle_reason_hw_slowdown>Not Active</clocks_throttle_reason_hw_slowdown>
+    </clocks_throttle_reasons>
+    <power_readings>
+      <power_draw>28.00 W</power_draw>
+      <power_limit>450.00 W</power_limit>
+    </power_readings>
+    <pci>
+      <replay_counter>0</replay_counter>
+    </pci>
+  </gpu>
+</nvidia_smi_log>

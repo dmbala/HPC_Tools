@@ -1,0 +1,5 @@
+<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <driver_version>550.54.15</driver_version>
+  <gpu id="00000000:19:00.0">
+    <product_name>NVIDIA H100

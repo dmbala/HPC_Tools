@@ -1,0 +1,98 @@
+<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <timestamp>Thu Jul  2 10:00:00 2026</timestamp>
+  <driver_version>550.54.15</driver_version>
+  <attached_gpus>2</attached_gpus>
+  <gpu id="00000000:19:00.0">
+    <product_name>NVIDIA H100 80GB HBM3</product_name>
+    <serial>1650000000001</serial>
+    <minor_number>0</minor_number>
+    <ecc_mode>
+      <current_ecc>Enabled</current_ecc>
+      <pending_ecc>Enabled</pending_ecc>
+    </ecc_mode>
+    <ecc_errors>
+      <volatile>
+        <sram_correctable>0</sram_correctable>
+        <sram_uncorrectable>0</sram_uncorrectable>
+        <dram_correctable>0</dram_correctable>
+        <dram_uncorrectable>0</dram_uncorrectable>
+      </volatile>
+      <aggregate>
+        <sram_correctable>0</sram_correctable>
+        <sram_uncorrectable>0</sram_uncorrectable>
+        <dram_correctable>0</dram_correctable>
+        <dram_uncorrectable>0</dram_uncorrectable>
+      </aggregate>
+    </ecc_errors>
+    <remapped_rows>
+      <remapped_row_corr>0</remapped_row_corr>
+      <remapped_row_unc>0</remapped_row_unc>
+      <remapped_row_pending>No</remapped_row_pending>
+      <remapped_row_failure>No</remapped_row_failure>
+    </remapped_rows>
+    <temperature>
+      <gpu_temp>41 C</gpu_temp>
+      <gpu_temp_slow_threshold>92 C</gpu_temp_slow_threshold>
+    </temperature>
+    <clocks_throttle_reasons>
+      <clocks_throttle_reason_sw_power_cap>Not Active</clocks_throttle_reason_sw_power_cap>
+      <clocks_throttle_reason_sw_thermal_slowdown>Not Active</clocks_throttle_reason_sw_thermal_slowdown>
+      <clocks_throttle_reason_hw_thermal_slowdown>Not Active</clocks_throttle_reason_hw_thermal_slowdown>
+      <clocks_throttle_reason_hw_slowdown>Not Active</clocks_throttle_reason_hw_slowdown>
+    </clocks_throttle_reasons>
+    <gpu_power_readings>
+      <power_draw>71.50 W</power_draw>
+      <current_power_limit>700.00 W</current_power_limit>
+    </gpu_power_readings>
+    <pci>
+      <replay_counter>0</replay_counter>
+    </pci>
+  </gpu>
+  <gpu id="00000000:3B:00.0">
+    <product_name>NVIDIA H100 80GB HBM3</product_name>
+    <serial>1650000000002</serial>
+    <minor_number>1</minor_number>
+    <ecc_mode>
+      <current_ecc>Enabled</current_ecc>
+      <pending_ecc>Enabled</pending_ecc>
+    </ecc_mode>
+    <ecc_errors>
+      <volatile>
+        <sram_correctable>0</sram_correctable>
+        <sram_uncorrectable>0</sram_uncorrectable>
+        <dram_correctable>0</dram_correctable>
+        <dram_uncorrectable>0</dram_uncorrectable>
+      </volatile>
+      <aggregate>
+        <sram_correctable>0</sram_correctable>
+        <sram_uncorrectable>0</sram_uncorrectable>
+        <dram_correctable>0</dram_correctable>
+        <dram_uncorrectable>0</dram_uncorrectable>
+      </aggregate>
+    </ecc_errors>
+    <remapped_rows>
+      <remapped_row_corr>0</remapped_row_corr>
+      <remapped_row_unc>0</remapped_row_unc>
+      <remapped_row_pending>No</remapped_row_pending>
+      <remapped_row_failure>No</remapped_row_failure>
+    </remapped_rows>
+    <temperature>
+      <gpu_temp>39 C</gpu_temp>
+      <gpu_temp_slow_threshold>92 C</gpu_temp_slow_threshold>
+    </temperature>
+    <clocks_throttle_reasons>
+      <clocks_throttle_reason_sw_power_cap>Not Active</clocks_throttle_reason_sw_power_cap>
+      <clocks_throttle_reason_sw_thermal_slowdown>Not Active</clocks_throttle_reason_sw_thermal_slowdown>
+      <clocks_throttle_reason_hw_thermal_slowdown>Not Active</clocks_throttle_reason_hw_thermal_slowdown>
+      <clocks_throttle_reason_hw_slowdown>Not Active</clocks_throttle_reason_hw_slowdown>
+    </clocks_throttle_reasons>
+    <gpu_power_readings>
+      <power_draw>68.20 W</power_draw>
+      <current_power_limit>700.00 W</current_power_limit>
+    </gpu_power_readings>
+    <pci>
+      <replay_counter>0</replay_counter>
+    </pci>
+  </gpu>
+</nvidia_smi_log>

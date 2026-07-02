@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""gpu_health -- node-local, read-only GPU health probe.
+
+Checks ECC & row-remap state, clock throttling, and PCIe/NVLink error
+counters via nvidia-smi, and reports a tiered OK/WARN/FAIL verdict per GPU
+and for the node. Hardware health only -- for utilization/profiling see
+jobstats_dcgm in this directory.
+
+Usage:
+    gpu_health                 # human-readable report, verdict via exit code
+    gpu_health --json [FILE]   # JSON snapshot to stdout (or FILE)
+    gpu_health --from-xml F    # replay a captured `nvidia-smi -q -x` dump
+                               # (NVLink counters read from F.nvlink if present)
+
+Exit codes: 0 OK, 1 WARN, 2 FAIL, 3 probe error (nvidia-smi missing/failed).
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+# Verdict thresholds
+CORRECTABLE_ECC_WARN = 100  # volatile correctable ECC errors before WARN
+TEMP_MARGIN_C = 5           # WARN when temp is within this of slowdown threshold
+
+OK, WARN, FAIL, NA = "OK", "WARN", "FAIL", "n/a"
+_SEVERITY = {NA: 0, OK: 0, WARN: 1, FAIL: 2}
+_EXIT_FOR = {OK: 0, WARN: 1, FAIL: 2}
+EXIT_ERROR = 3
+
+
+def _find_text(node, *paths):
+    """First meaningful text at any of the candidate relative paths, else None.
+
+    Multiple paths cover tag renames across driver versions. 'N/A' and empty
+    text count as absent.
+    """
+    if node is None:
+        return None
+    for path in paths:
+        el = node.find(path)
+        if el is not None and el.text:
+            text = el.text.strip()
+            if text and text != "N/A":
+                return text
+    return None
+
+
+def _to_int(text):
+    if text is None:
+        return None
+    m = re.match(r"-?\d+", text)
+    return int(m.group()) if m else None
+
+
+def _to_float(text):
+    if text is None:
+        return None
+    m = re.match(r"-?\d+(\.\d+)?", text)
+    return float(m.group()) if m else None
+
+
+def _yesno(text):
+    """'Yes'/'No' -> bool; None/unrecognized -> None."""
+    if text is None:
+        return None
+    return text.strip().lower() == "yes"
+
+
+def _throttle_flag(node, *paths):
+    """'Active'/'Not Active' -> bool; absent -> None."""
+    text = _find_text(node, *paths)
+    if text is None:
+        return None
+    return text.strip().lower() == "active"
+
+
+def _ecc_count(section, kind):
+    """Total ECC errors of `kind` ('correctable'|'uncorrectable') in a
+    <volatile> or <aggregate> section. Handles both the sram_*/dram_* layout
+    (A100/H100) and the older single_bit/double_bit layout. None if absent."""
+    if section is None:
+        return None
+    sram = _to_int(_find_text(section, "sram_%s" % kind))
+    dram = _to_int(_find_text(section, "dram_%s" % kind))
+    if sram is not None or dram is not None:
+        return (sram or 0) + (dram or 0)
+    old = "single_bit" if kind == "correctable" else "double_bit"
+    return _to_int(_find_text(section, old + "/total"))
+
+
+def parse_smi_xml(xml_text):
+    """Parse `nvidia-smi -q -x` output.
+
+    Returns {'driver_version': str|None, 'gpus': [dict, ...]}.
+    Raises ValueError when the XML does not parse or contains no <gpu>.
+    Missing individual fields become None (n/a downstream), never an error.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError("nvidia-smi XML did not parse: %s" % exc)
+    gpu_nodes = root.findall("gpu")
+    if not gpu_nodes:
+        raise ValueError("no <gpu> elements in nvidia-smi XML")
+
+    gpus = []
+    for position, node in enumerate(gpu_nodes):
+        ecc = node.find("ecc_errors")
+        volatile = ecc.find("volatile") if ecc is not None else None
+        aggregate = ecc.find("aggregate") if ecc is not None else None
+        remap = node.find("remapped_rows")
+        # driver >= 555 renamed clocks_throttle_reasons -> clocks_event_reasons
+        throttle_node = node.find("clocks_throttle_reasons")
+        if throttle_node is None:
+            throttle_node = node.find("clocks_event_reasons")
+        throttle = None
+        if throttle_node is not None:
+            throttle = {
+                "sw_power_cap": _throttle_flag(
+                    throttle_node,
+                    "clocks_throttle_reason_sw_power_cap",
+                    "clocks_event_reason_sw_power_cap"),
+                "sw_thermal": _throttle_flag(
+                    throttle_node,
+                    "clocks_throttle_reason_sw_thermal_slowdown",
+                    "clocks_event_reason_sw_thermal_slowdown"),
+                "hw_thermal": _throttle_flag(
+                    throttle_node,
+                    "clocks_throttle_reason_hw_thermal_slowdown",
+                    "clocks_event_reason_hw_thermal_slowdown"),
+                "hw_slowdown": _throttle_flag(
+                    throttle_node,
+                    "clocks_throttle_reason_hw_slowdown",
+                    "clocks_event_reason_hw_slowdown"),
+            }
+        ecc_mode = _find_text(node, "ecc_mode/current_ecc")
+        minor = _to_int(_find_text(node, "minor_number"))
+        gpus.append({
+            "index": minor if minor is not None else position,
+            "name": _find_text(node, "product_name"),
+            "serial": _find_text(node, "serial"),
+            "ecc_enabled": None if ecc_mode is None
+                           else ecc_mode.lower() == "enabled",
+            "volatile_correctable": _ecc_count(volatile, "correctable"),
+            "volatile_uncorrectable": _ecc_count(volatile, "uncorrectable"),
+            "aggregate_uncorrectable": _ecc_count(aggregate, "uncorrectable"),
+            "row_remap_pending": _yesno(_find_text(remap, "remapped_row_pending")),
+            "row_remap_failure": _yesno(_find_text(remap, "remapped_row_failure")),
+            "retired_pages_pending": _yesno(
+                _find_text(node, "retired_pages/pending_retirement")),
+            "throttle": throttle,
+            "temp_c": _to_int(_find_text(node, "temperature/gpu_temp")),
+            "slowdown_temp_c": _to_int(
+                _find_text(node, "temperature/gpu_temp_slow_threshold")),
+            "power_w": _to_float(_find_text(
+                node, "gpu_power_readings/power_draw",
+                "power_readings/power_draw")),
+            "power_limit_w": _to_float(_find_text(
+                node, "gpu_power_readings/current_power_limit",
+                "power_readings/current_power_limit",
+                "power_readings/power_limit")),
+            "pcie_replay": _to_int(_find_text(node, "pci/replay_counter")),
+        })
+    return {"driver_version": _find_text(root, "driver_version"), "gpus": gpus}
+
+
+if __name__ == "__main__":
+    sys.exit(0)  # replaced by main() in a later task
