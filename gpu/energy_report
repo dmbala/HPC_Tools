@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""energy_report -- per-user/account GPU energy (kWh) over a window.
+
+Lists the target's GPU jobs via sacct, then reads each job's energy from
+DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION (a monotonic mJ counter) as
+max_over_time - min_over_time across the job's window, joined to the job's
+GPUs the same way jobstats_dcgm does (nvidia_gpu_jobId -> UUID). Runs
+wherever jobstats is installed -- no allocation needed. Report-only.
+
+Caveat: a mid-job GPU driver reload resets the counter and skews that
+job's delta; treat per-job values as estimates.
+
+Usage:
+    energy_report (-u USER | -A ACCOUNT)
+                  [--days N | --since ISO --until ISO]
+                  [--top N] [--max-jobs M] [--json]
+
+Exit codes: 0 report, 3 probe/setup error.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import gpulib
+
+TOOL = "energy_report"
+MJ_PER_KWH = 3.6e9
+
+
+def _elapsed_seconds(text):
+    """sacct Elapsed '[DD-]HH:MM:SS' -> seconds (0 on parse failure)."""
+    if not text:
+        return 0
+    days = 0
+    if "-" in text:
+        day_part, text = text.split("-", 1)
+        try:
+            days = int(day_part)
+        except ValueError:
+            return 0
+    parts = text.split(":")
+    try:
+        hours, minutes, seconds = (int(p) for p in parts[-3:])
+    except ValueError:
+        return 0
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _gpus_from_tres(tres):
+    """GPU count from AllocTRES ('gres/gpu=4', or typed 'gres/gpu:h100=4')."""
+    fallback = 0
+    for item in (tres or "").split(","):
+        if item.startswith("gres/gpu="):
+            try:
+                return int(item.split("=", 1)[1])
+            except ValueError:
+                return 0
+        if item.startswith("gres/gpu:") and "=" in item:
+            try:
+                fallback = int(item.split("=", 1)[1])
+            except ValueError:
+                pass
+    return fallback
+
+
+def parse_sacct_jobs(text):
+    """-P rows 'JobIDRaw|User|Account|Start|End|Elapsed|AllocTRES|State'
+    -> GPU-job dicts (non-GPU jobs dropped)."""
+    jobs = []
+    for line in (text or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 8 or not parts[0].isdigit():
+            continue
+        gpus = _gpus_from_tres(parts[6])
+        if not gpus:
+            continue
+        jobs.append({"jobid": int(parts[0]), "user": parts[1],
+                     "account": parts[2], "start": parts[3], "end": parts[4],
+                     "elapsed_s": _elapsed_seconds(parts[5]), "gpus": gpus,
+                     "state": parts[7].split()[0] if parts[7] else ""})
+    return jobs
+
+
+def energy_kwh(delta_result, uuids):
+    """Sum a per-UUID energy-delta instant result (mJ) over the job's GPUs
+    -> kWh; None when no series matched (reported as 'no data')."""
+    wanted = set(uuids)
+    total_mj, matched = 0.0, False
+    for series in delta_result:
+        if gpulib.series_uuid(series.get("metric", {})) not in wanted:
+            continue
+        try:
+            total_mj += float(series["value"][1])
+            matched = True
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+    return (total_mj / MJ_PER_KWH) if matched else None
+
+
+def uuid_regex(uuids):
+    """Validated alternation for a PromQL UUID=~ selector.
+
+    UUIDs are hex + hyphen, which is RE2-safe as a literal; anything else is
+    dropped (returned separately) rather than escaped, because Python
+    re.escape output (e.g. GPU\\-...) is not valid inside a PromQL string.
+    Returns (regex_or_None, safe_uuids, dropped_count).
+    """
+    safe = [u for u in uuids if u and re.match(r"^[A-Za-z0-9-]+$", u)]
+    dropped = len(uuids) - len(safe)
+    return ("|".join(safe) if safe else None), safe, dropped
+
+
+def rollup(job_rows, top_n):
+    counted = [j for j in job_rows if j.get("kwh") is not None]
+    total_kwh = sum(j["kwh"] for j in counted)
+    total_gpu_h = sum(j["elapsed_s"] * j["gpus"] for j in counted) / 3600.0
+    per_user = {}
+    for j in counted:
+        per_user[j["user"]] = per_user.get(j["user"], 0.0) + j["kwh"]
+    return {"counted": len(counted),
+            "no_data": len(job_rows) - len(counted),
+            "total_kwh": total_kwh,
+            "total_gpu_hours": total_gpu_h,
+            "mean_w_per_gpu": (total_kwh / total_gpu_h * 1000.0)
+                              if total_gpu_h else 0.0,
+            "top_jobs": sorted(counted, key=lambda j: j["kwh"],
+                               reverse=True)[:top_n],
+            "per_user_kwh": per_user}
+
+
+def _end_epoch(job):
+    try:
+        return gpulib.iso_epoch(job["end"])
+    except (ValueError, TypeError):
+        return int(time.time())  # still running / Unknown
+
+
+def _fmt(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def render(summary, start, end):
+    lines = ["energy_report: %s -> %s" % (_fmt(start), _fmt(end))]
+    lines.append("  jobs counted: %d   no data: %d   skipped by "
+                 "--max-jobs: %d" % (summary["counted"], summary["no_data"],
+                                     summary.get("skipped", 0)))
+    lines.append("  total energy : %.2f kWh over %.1f GPU-hours "
+                 "(mean %.0f W per GPU)"
+                 % (summary["total_kwh"], summary["total_gpu_hours"],
+                    summary["mean_w_per_gpu"]))
+    if summary["top_jobs"]:
+        lines.append("")
+        row = "%-12s %-10s %10s %8s %8s %s"
+        lines.append(row % ("JOBID", "USER", "KWH", "GPU_H", "MEAN_W",
+                            "STATE"))
+        for j in summary["top_jobs"]:
+            gpu_h = j["elapsed_s"] * j["gpus"] / 3600.0
+            mean_w = (j["kwh"] / gpu_h * 1000.0) if gpu_h else 0.0
+            lines.append(row % (j["jobid"], j["user"], "%.2f" % j["kwh"],
+                                "%.1f" % gpu_h, "%.0f" % mean_w, j["state"]))
+    if len(summary["per_user_kwh"]) > 1:
+        lines.append("")
+        lines.append("per-user kWh:")
+        for user, kwh in sorted(summary["per_user_kwh"].items(),
+                                key=lambda kv: kv[1], reverse=True):
+            lines.append("  %-12s %10.2f" % (user, kwh))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="per-user/account GPU energy (kWh) over a window from "
+                    "DCGM counters (exit 0 report, 3 error)")
+    gpulib.add_window_args(parser)
+    parser.add_argument("-u", "--user")
+    parser.add_argument("-A", "--account")
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--max-jobs", type=int, default=200, dest="max_jobs",
+                        help="cap on per-job Prometheus queries "
+                             "(default 200; truncation is reported)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-json", metavar="FILE",
+                        help="replay a captured query bundle (testing)")
+    args = parser.parse_args(argv)
+    if bool(args.user) == bool(args.account):
+        gpulib.err_exit(TOOL, "exactly one of -u USER or -A ACCOUNT required")
+    if args.max_jobs < 0 or args.top < 0:
+        gpulib.err_exit(TOOL, "--max-jobs and --top must be >= 0")
+    start, end = gpulib.parse_window(args, TOOL)
+
+    discovery = energy = None
+    if args.from_json:
+        bundle = gpulib.load_bundle(args.from_json, TOOL)
+        sacct_text = bundle.get("sacct", "")
+        discovery = bundle.get("discovery", {})
+        energy = bundle.get("energy", {})
+        prom = None
+    else:
+        prom = gpulib.load_prom_server(TOOL)
+        cmd = ["sacct", "-X", "-n", "-P", "-o",
+               "JobIDRaw,User,Account,Start,End,Elapsed,AllocTRES,State",
+               "-S", datetime.datetime.fromtimestamp(start).strftime(
+                   "%Y-%m-%dT%H:%M:%S"),
+               "-E", datetime.datetime.fromtimestamp(end).strftime(
+                   "%Y-%m-%dT%H:%M:%S")]
+        if args.user:
+            cmd += ["-u", args.user]
+        else:
+            cmd += ["-A", args.account, "-a"]
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            gpulib.err_exit(TOOL, "sacct failed: %s" % exc)
+        if r.returncode != 0:
+            gpulib.err_exit(TOOL, "sacct failed: %s" % r.stderr.strip())
+        sacct_text = r.stdout
+
+    jobs = parse_sacct_jobs(sacct_text)
+    skipped = max(0, len(jobs) - args.max_jobs)
+    jobs = jobs[:args.max_jobs]
+
+    for job in jobs:
+        jid = str(job["jobid"])
+        window_s = max(job["elapsed_s"], 60)
+        if args.from_json:
+            disc = discovery.get(jid, [])
+        else:
+            try:
+                disc = gpulib.query(
+                    prom, "max_over_time((nvidia_gpu_jobId == %d)[%ds:])"
+                    % (job["jobid"], window_s), when=_end_epoch(job))
+            except RuntimeError as exc:
+                gpulib.err_exit(TOOL, str(exc))
+        uuids = [u for u in (gpulib.series_uuid(s.get("metric", {}))
+                             for s in disc) if u]
+        if not uuids:
+            job["kwh"] = None
+            continue
+        if args.from_json:
+            eres = energy.get(jid, [])
+        else:
+            rx, safe_uuids, dropped = uuid_regex(uuids)
+            if dropped:
+                sys.stderr.write("warning: job %s: skipped %d uuid(s) with "
+                                 "unexpected characters\n" % (jid, dropped))
+            if rx is None:
+                job["kwh"] = None
+                continue
+            uuids = safe_uuids
+            promql = ("(max_over_time(DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION"
+                      "{UUID=~\"%s\"}[%ds:]) - min_over_time("
+                      "DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION{UUID=~\"%s\"}"
+                      "[%ds:]))" % (rx, window_s, rx, window_s))
+            try:
+                eres = gpulib.query(prom, promql, when=_end_epoch(job))
+            except RuntimeError as exc:
+                gpulib.err_exit(TOOL, str(exc))
+        job["kwh"] = energy_kwh(eres, uuids)
+
+    summary = rollup(jobs, args.top)
+    summary["skipped"] = skipped
+    if args.json:
+        print(json.dumps({"start": start, "end": end, "summary": summary},
+                         indent=2))
+    else:
+        print(render(summary, start, end))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+[
+  {"metric": {"Hostname": "holygpu8a10302.rc.fas.harvard.edu",
+              "UUID": "GPU-aaa", "gpu": "0", "err_code": "79",
+              "err_msg": "GPU has fallen off the bus"},
+   "values": [[1751500000, "79"], [1751500300, "79"], [1751502400, "79"]]},
+  {"metric": {"Hostname": "holygpu8a10402.rc.fas.harvard.edu",
+              "UUID": "GPU-bbb", "gpu": "2", "err_code": "43",
+              "err_msg": "GPU stopped processing"},
+   "values": [[1751501000, "43"]]}
+]

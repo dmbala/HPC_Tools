@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""fleet_util -- what fraction of ALLOCATED GPU-hours actually did work.
+
+Over a window, per Slurm partition: GPU-hours allocated to jobs
+(nvidia_gpu_jobId > 0) vs GPU-hours whose SM activity
+(DCGM_FI_PROF_SM_ACTIVE) was below a threshold. Capacity-planning evidence:
+"the GPUs are all taken" vs "the GPUs are all working" are different claims.
+Runs wherever jobstats is installed -- no allocation needed. Report-only.
+
+Usage:
+    fleet_util [--days N | --since ISO --until ISO] [--partition P]
+               [--threshold PCT] [--step HOURS] [--json]
+
+Exit codes: 0 report, 3 probe/setup error.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import gpulib
+
+TOOL = "fleet_util"
+WORST_N = 5
+
+
+def parse_sinfo_map(text):
+    """sinfo -N -h -o '%n %P' rows -> {node: [partitions]} ('*' stripped)."""
+    mapping = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            mapping.setdefault(parts[0], []).append(parts[1].rstrip("*"))
+    return mapping
+
+
+def utilization(alloc_matrix, smact_matrix, node_to_parts, threshold_pct,
+                step_s, allowed_nodes=None):
+    """Join allocation and SM-activity matrices per (uuid, timestep).
+
+    A sample is wasted when allocated AND sm*100 < threshold_pct; unmatched
+    when allocated but no SM sample exists for that (uuid, ts) -- counted
+    separately, never guessed. A node in several partitions is attributed
+    to each; 'overall' counts each GPU-hour once.
+    """
+    smact = {}
+    for series in smact_matrix:
+        uuid = gpulib.series_uuid(series.get("metric", {}))
+        for ts, val in series.get("values", []):
+            try:
+                smact[(uuid, float(ts))] = float(val)
+            except (TypeError, ValueError):
+                continue
+    hours = step_s / 3600.0
+    partitions = {}
+    overall = {"allocated_h": 0.0, "wasted_h": 0.0, "unmatched_h": 0.0}
+    node_wasted = {}
+    for series in alloc_matrix:
+        labels = series.get("metric", {})
+        uuid = gpulib.series_uuid(labels)
+        node = (labels.get("host") or labels.get("Hostname")
+                or "?").split(":")[0].split(".")[0]
+        if allowed_nodes is not None and node not in allowed_nodes:
+            continue
+        parts = node_to_parts.get(node, ["(unknown)"])
+        for ts, val in series.get("values", []):
+            try:
+                if float(val) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            sm = smact.get((uuid, float(ts)))
+            wasted = sm is not None and sm * 100.0 < threshold_pct
+            unmatched = sm is None
+            overall["allocated_h"] += hours
+            if wasted:
+                overall["wasted_h"] += hours
+                node_wasted[node] = node_wasted.get(node, 0.0) + hours
+            if unmatched:
+                overall["unmatched_h"] += hours
+            for part in parts:
+                stats = partitions.setdefault(
+                    part, {"allocated_h": 0.0, "wasted_h": 0.0,
+                           "unmatched_h": 0.0})
+                stats["allocated_h"] += hours
+                if wasted:
+                    stats["wasted_h"] += hours
+                if unmatched:
+                    stats["unmatched_h"] += hours
+    worst = sorted(node_wasted.items(), key=lambda kv: kv[1],
+                   reverse=True)[:WORST_N]
+    return {"partitions": partitions, "overall": overall,
+            "worst_nodes": worst, "threshold_pct": threshold_pct}
+
+
+def _fmt(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def render(result, start, end, step_h):
+    lines = ["fleet_util: %s -> %s  (step %gh, wasted = SM_ACT < %g%%)"
+             % (_fmt(start), _fmt(end), step_h, result["threshold_pct"]), ""]
+    row = "%-24s %12s %12s %8s %12s"
+    lines.append(row % ("PARTITION", "ALLOC_GPU_H", "WASTED_GPU_H",
+                        "WASTED%", "UNMATCHED_H"))
+
+    def emit(name, stats):
+        pct = (100.0 * stats["wasted_h"] / stats["allocated_h"]) \
+            if stats["allocated_h"] else 0.0
+        lines.append(row % (name, "%.1f" % stats["allocated_h"],
+                            "%.1f" % stats["wasted_h"], "%.1f" % pct,
+                            "%.1f" % stats["unmatched_h"]))
+
+    for part in sorted(result["partitions"]):
+        emit(part, result["partitions"][part])
+    emit("(overall)", result["overall"])
+    if result["worst_nodes"]:
+        lines.append("")
+        lines.append("worst nodes by wasted GPU-hours:")
+        for node, wasted_h in result["worst_nodes"]:
+            lines.append("  %-20s %10.1f" % (node, wasted_h))
+    lines.append("")
+    lines.append("note: a node in several partitions is counted in each; "
+                 "(overall) counts each GPU-hour once")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="fraction of allocated GPU-hours with SM activity below "
+                    "a threshold, by partition (exit 0 report, 3 error)")
+    gpulib.add_window_args(parser)
+    parser.add_argument("--partition", help="restrict to one partition")
+    parser.add_argument("--threshold", type=float, default=10.0,
+                        help="wasted when SM_ACT%% is below this (default 10)")
+    parser.add_argument("--step", type=float, default=1.0,
+                        help="sample step in hours (default 1)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-json", metavar="FILE",
+                        help="replay a captured query bundle (testing)")
+    args = parser.parse_args(argv)
+    start, end = gpulib.parse_window(args, TOOL)
+    step_s = int(args.step * 3600)
+    if step_s < 60:
+        gpulib.err_exit(TOOL, "--step must be at least 0.0167 hours (60s)")
+
+    if args.from_json:
+        bundle = gpulib.load_bundle(args.from_json, TOOL)
+        alloc = bundle.get("alloc", [])
+        smact = bundle.get("smact", [])
+        sinfo_text = bundle.get("sinfo", "")
+    else:
+        prom = gpulib.load_prom_server(TOOL)
+        try:
+            alloc = gpulib.query_range(prom, "nvidia_gpu_jobId > 0",
+                                       start, end, step_s)
+            smact = gpulib.query_range(prom, "DCGM_FI_PROF_SM_ACTIVE",
+                                       start, end, step_s)
+        except RuntimeError as exc:
+            gpulib.err_exit(TOOL, str(exc))
+        try:
+            r = subprocess.run(["sinfo", "-N", "-h", "-o", "%n %P"],
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            gpulib.err_exit(TOOL, "sinfo failed: %s" % exc)
+        if r.returncode != 0:
+            gpulib.err_exit(TOOL, "sinfo failed: %s" % r.stderr.strip())
+        sinfo_text = r.stdout
+
+    node_to_parts = parse_sinfo_map(sinfo_text)
+    allowed = None
+    if args.partition:
+        allowed = set(node for node, parts in node_to_parts.items()
+                      if args.partition in parts)
+        if not allowed:
+            gpulib.err_exit(TOOL, "no nodes found in partition %s"
+                            % args.partition)
+    result = utilization(alloc, smact, node_to_parts, args.threshold,
+                         step_s, allowed_nodes=allowed)
+    if args.json:
+        print(json.dumps({"start": start, "end": end, "result": result},
+                         indent=2))
+    else:
+        print(render(result, start, end, args.step))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
