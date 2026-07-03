@@ -33,7 +33,7 @@ def err_exit(msg):
 
 
 def measure_write(path, size_mb):
-    """Stream size_mb of zeros in CHUNK pieces, fsync, return MB/s."""
+    """Stream ~size_mb of zeros in whole CHUNK pieces, fsync; -> (MB/s, MB written)."""
     chunk = b"\0" * CHUNK
     chunks = max(1, int(size_mb * 1024 * 1024) // CHUNK)
     start = time.time()
@@ -44,7 +44,7 @@ def measure_write(path, size_mb):
         os.fsync(fh.fileno())
     elapsed = time.time() - start
     total_mb = chunks * CHUNK / (1024.0 * 1024.0)
-    return total_mb / elapsed if elapsed > 0 else float("inf")
+    return (total_mb / elapsed if elapsed > 0 else float("inf")), total_mb
 
 
 def measure_read(path):
@@ -157,12 +157,12 @@ def main(argv=None):
     try:
         data_path = os.path.join(scratch, "data.bin")
         try:
-            write_mbs = measure_write(data_path, args.size)
+            write_mbs, written_mb = measure_write(data_path, args.size)
             read_mbs = measure_read(data_path)
             meta_ms = measure_meta(scratch, args.meta_files)
         except (OSError, IOError) as exc:
             err_exit("io failure during probe: %s" % exc)
-        metrics = {"dir": args.dir, "size_mb": args.size,
+        metrics = {"dir": args.dir, "size_mb": written_mb,
                    "meta_files": args.meta_files,
                    "write_mbs": write_mbs, "read_mbs": read_mbs,
                    "read_cached": True, "meta_ms": meta_ms}

@@ -114,6 +114,12 @@ class TestCliRealProbe(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         self.assertIn("io_probe: error:", proc.stderr)
 
+    def test_size_reports_actual_bytes_written(self):
+        proc = run_cli(*self.args("--json"))
+        payload = json.loads(proc.stdout)
+        # --size 1 rounds up to one whole 4MB chunk; the report must say so
+        self.assertAlmostEqual(payload["size_mb"], 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()
