@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""io_probe -- quick filesystem responsiveness probe (NOT a benchmark).
+
+Adapted in spirit from fasrc/reframe-fasrc checks/system/io (IOR check),
+reduced to a seconds-long probe: bounded sequential write/read MB/s plus
+small-file metadata latency, against a target directory. Runs where
+invoked (wrap in srun to probe from a compute node). The read re-reads the
+just-written file, so it is page-cache-assisted -- reported honestly.
+
+Usage:
+    io_probe --dir TARGET [--size MB] [--meta-files N]
+             [--min-write MBS] [--min-read MBS] [--max-meta-ms MS]
+             [--keep] [--json]
+
+Exit codes: 0 report-only or all gates pass, 1 a gate missed, 3 setup/IO
+error.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+
+TOOL = "io_probe"
+CHUNK = 4 * 1024 * 1024  # 4 MB
+
+
+def err_exit(msg):
+    sys.stderr.write("%s: error: %s\n" % (TOOL, msg))
+    sys.exit(3)
+
+
+def measure_write(path, size_mb):
+    """Stream ~size_mb of zeros in whole CHUNK pieces, fsync; -> (MB/s, MB written)."""
+    chunk = b"\0" * CHUNK
+    chunks = max(1, int(size_mb * 1024 * 1024) // CHUNK)
+    start = time.time()
+    with open(path, "wb") as fh:
+        for _ in range(chunks):
+            fh.write(chunk)
+        fh.flush()
+        os.fsync(fh.fileno())
+    elapsed = time.time() - start
+    total_mb = chunks * CHUNK / (1024.0 * 1024.0)
+    return (total_mb / elapsed if elapsed > 0 else float("inf")), total_mb
+
+
+def measure_read(path):
+    """Re-read the file in CHUNK pieces, return MB/s (page-cache-assisted)."""
+    size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
+    start = time.time()
+    with open(path, "rb") as fh:
+        while fh.read(CHUNK):
+            pass
+    elapsed = time.time() - start
+    return size_mb / elapsed if elapsed > 0 else float("inf")
+
+
+def measure_meta(dirpath, count):
+    """create/stat/delete `count` empty files -> mean ms per op."""
+    names = [os.path.join(dirpath, "meta%05d" % i) for i in range(count)]
+    t0 = time.time()
+    for name in names:
+        open(name, "w").close()
+    t1 = time.time()
+    for name in names:
+        os.stat(name)
+    t2 = time.time()
+    for name in names:
+        os.unlink(name)
+    t3 = time.time()
+    per = lambda a, b: (b - a) * 1000.0 / count  # noqa: E731
+    return {"create": per(t0, t1), "stat": per(t1, t2),
+            "delete": per(t2, t3)}
+
+
+def verdict(metrics, gates):
+    """-> (status, reasons): REPORT when no gate set; else PASS/FAIL."""
+    reasons = []
+    gated = False
+    if gates.get("min_write") is not None:
+        gated = True
+        if metrics["write_mbs"] < gates["min_write"]:
+            reasons.append("write %.1f MB/s below --min-write %.1f"
+                           % (metrics["write_mbs"], gates["min_write"]))
+    if gates.get("min_read") is not None:
+        gated = True
+        if metrics["read_mbs"] < gates["min_read"]:
+            reasons.append("read %.1f MB/s below --min-read %.1f"
+                           % (metrics["read_mbs"], gates["min_read"]))
+    if gates.get("max_meta_ms") is not None:
+        gated = True
+        worst = max(metrics["meta_ms"].values())
+        if worst > gates["max_meta_ms"]:
+            reasons.append("metadata %.2f ms/op above --max-meta-ms %.2f"
+                           % (worst, gates["max_meta_ms"]))
+    if not gated:
+        return "REPORT", []
+    return ("FAIL" if reasons else "PASS"), reasons
+
+
+def render(metrics, status, reasons):
+    lines = ["io_probe: %s  (%.0f MB file, %d metadata files)"
+             % (metrics["dir"], metrics["size_mb"],
+                metrics["meta_files"])]
+    lines.append("  write     : %8.1f MB/s (fsync included)"
+                 % metrics["write_mbs"])
+    lines.append("  read      : %8.1f MB/s (page-cache-assisted on this "
+                 "host)" % metrics["read_mbs"])
+    lines.append("  metadata  : create %.2f  stat %.2f  delete %.2f ms/op"
+                 % (metrics["meta_ms"]["create"],
+                    metrics["meta_ms"]["stat"],
+                    metrics["meta_ms"]["delete"]))
+    lines.append("verdict: %s%s"
+                 % (status, "" if not reasons
+                    else " (" + "; ".join(reasons) + ")"))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="quick filesystem responsiveness probe "
+                    "(exit 0 report/pass, 1 gate missed, 3 error)")
+    parser.add_argument("--dir", required=True, metavar="TARGET",
+                        help="directory to probe (a scratch subdir is "
+                             "created inside it)")
+    parser.add_argument("--size", type=float, default=256.0, metavar="MB",
+                        help="sequential file size (default 256)")
+    parser.add_argument("--meta-files", type=int, default=100,
+                        dest="meta_files",
+                        help="metadata batch size (default 100)")
+    parser.add_argument("--min-write", type=float, dest="min_write",
+                        metavar="MBS")
+    parser.add_argument("--min-read", type=float, dest="min_read",
+                        metavar="MBS")
+    parser.add_argument("--max-meta-ms", type=float, dest="max_meta_ms",
+                        metavar="MS")
+    parser.add_argument("--keep", action="store_true",
+                        help="keep the scratch subdir")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    args = parser.parse_args(argv)
+    if args.size <= 0 or args.meta_files <= 0:
+        err_exit("--size and --meta-files must be > 0")
+
+    if not os.path.isdir(args.dir):
+        err_exit("target directory does not exist: %s" % args.dir)
+    scratch = os.path.join(args.dir, ".io_probe.%d" % os.getpid())
+    try:
+        os.mkdir(scratch)
+    except OSError as exc:
+        err_exit("cannot create scratch dir: %s" % exc)
+
+    try:
+        data_path = os.path.join(scratch, "data.bin")
+        try:
+            write_mbs, written_mb = measure_write(data_path, args.size)
+            read_mbs = measure_read(data_path)
+            meta_ms = measure_meta(scratch, args.meta_files)
+        except (OSError, IOError) as exc:
+            err_exit("io failure during probe: %s" % exc)
+        metrics = {"dir": args.dir, "size_mb": written_mb,
+                   "meta_files": args.meta_files,
+                   "write_mbs": write_mbs, "read_mbs": read_mbs,
+                   "read_cached": True, "meta_ms": meta_ms}
+        gates = {"min_write": args.min_write, "min_read": args.min_read,
+                 "max_meta_ms": args.max_meta_ms}
+        status, reasons = verdict(metrics, gates)
+        if args.json:
+            print(json.dumps(dict(metrics, gates=gates, status=status,
+                                  reasons=reasons), indent=2))
+        else:
+            print(render(metrics, status, reasons))
+        return 1 if status == "FAIL" else 0
+    finally:
+        if not args.keep:
+            try:
+                shutil.rmtree(scratch)
+            except OSError as exc:
+                sys.stderr.write("warning: cleanup failed: %s\n" % exc)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
