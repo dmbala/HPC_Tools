@@ -1,0 +1,18 @@
+---------------------------------------------------------------------------------------
+                    RDMA_Write BW Test
+ Dual-port       : OFF          Device         : mlx5_0
+ Number of qps   : 1            Transport type : IB
+ Connection type : RC           Using SRQ      : OFF
+ TX depth        : 128
+ CQ Moderation   : 100
+ Mtu             : 4096[B]
+ Link type       : IB
+ Max inline data : 0[B]
+ rdma_cm QPs     : OFF
+ Data ex. method : Ethernet
+---------------------------------------------------------------------------------------
+ #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+ 2          5000             0.052              0.051                3.213725
+ 65536      5000             361.20             360.88               0.688305
+ 8388608    5000             389.45             389.20               0.005800
+---------------------------------------------------------------------------------------
