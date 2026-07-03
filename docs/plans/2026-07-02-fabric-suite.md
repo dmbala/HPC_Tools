@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.6-compatible stdlib (`argparse`, `json`, `re`, `subprocess`, `collections`, `unittest`). Slurm CLI. Existing `fabric/ib_snapshot.sh` and `fabric/counter_delta.sh`.
 
-**Spec:** `docs/superpowers/specs/2026-07-02-fabric-suite-design.md` (approved).
+**Spec:** `docs/specs/2026-07-02-fabric-suite-design.md` (approved).
 
 **One deliberate spec addition:** `fleet_snapshot --from-dir DIR` re-aggregates an existing snapshot directory offline (no Slurm). It exists so a past run can be re-analyzed and so the CLI's 0/1/3 exit paths are testable offline; it adds no new logic beyond skipping submission.
 

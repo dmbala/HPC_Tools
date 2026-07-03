@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.6-compatible stdlib; `sacct`/`sshare`/`scontrol`/`squeue`; `gpu/gpulib.py` (+`requests`) for `gpu_idle_now` only; stdlib `unittest`.
 
-**Spec:** `docs/superpowers/specs/2026-07-03-slurm-suite-design.md` (approved).
+**Spec:** `docs/specs/2026-07-03-slurm-suite-design.md` (approved).
 
 **Branch:** create `slurm-suite` FROM `gpu-suite` (controller does this before Task 1; the spec's merge order is gpu-health → gpu-suite → slurm-suite).
 

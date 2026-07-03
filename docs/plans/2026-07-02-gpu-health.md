@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3 stdlib only (`argparse`, `xml.etree.ElementTree`, `subprocess`, `json`, `re`, `unittest`). No pip packages, no DCGM, no Prometheus.
 
-**Spec:** `docs/superpowers/specs/2026-07-02-gpu-health-design.md` (approved).
+**Spec:** `docs/specs/2026-07-02-gpu-health-design.md` (approved).
 
 ## Global Constraints
 
