@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-07-02T12:00:00+00:00",
+  "hostname": "nodeb",
+  "system": {
+    "uname": "Linux nodeb 4.18.0-553.44.1.el8_10.x86_64 #1 SMP x86_64 GNU/Linux",
+    "nvidia_driver": "575.57.08",
+    "cuda_runtime": "release 12.2"
+  },
+  "gpus": {
+    "gpus": [
+      {"index": 0, "name": "NVIDIA H200", "pci_bus_id": "00000000:19:00.0",
+       "temp_c": 30.0, "power_draw_w": 70.0, "power_limit_w": 700.0,
+       "memory_total_mib": 143771, "memory_used_mib": 0,
+       "sm_clock_mhz": 345, "memory_clock_mhz": 2619},
+      {"index": 1, "name": "NVIDIA H200", "pci_bus_id": "00000000:3B:00.0",
+       "temp_c": 29.0, "power_draw_w": 71.0, "power_limit_w": 700.0,
+       "memory_total_mib": 143771, "memory_used_mib": 0,
+       "sm_clock_mhz": 345, "memory_clock_mhz": 2619}
+    ]
+  },
+  "nvlink": {"rc": 0, "raw": "GPU 0: NVIDIA H200\n\t Link 0: 26.562 GB/s\n"},
+  "topology": {"rc": 0, "raw": "\tGPU0\tGPU1\tNIC0\tCPU Affinity\nGPU0\t X \tNV18\tPXB\t0-47\nGPU1\tNV18\t X \tSYS\t48-95\nNIC0\tPXB\tSYS\t X \t\n"},
+  "ib": {
+    "hcas": [
+      {"name": "mlx5_0",
+       "ports": [
+         {"port": 1, "state": "4: ACTIVE", "phys_state": "5: LinkUp",
+          "rate": "400 Gb/sec (4X NDR)", "link_layer": "InfiniBand",
+          "counters": {"symbol_error": 0, "link_downed": 0,
+                       "port_xmit_discards": 0, "port_rcv_errors": 0,
+                       "port_xmit_data": 987654321}}
+       ],
+       "ibv_devinfo": "hca_id:\tmlx5_0\n\tfw_ver:\t28.39.1002\n\tport:\t1\n\t\tstate:\tPORT_ACTIVE (4)\n"}
+    ]
+  },
+  "ibdev2netdev": {
+    "mapping": [{"hca": "mlx5_0", "port": 1, "netdev": "ibp0", "state": "Up"}],
+    "raw": "mlx5_0 port 1 ==> ibp0 (Up)\n"
+  },
+  "nccl": {"libnccl_symlink_target": null}
+}

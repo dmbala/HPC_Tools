@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""fleet_snapshot -- run ib_snapshot.sh across a nodelist via Slurm and
+aggregate the results: version drift, link anomalies, error counters,
+unreached nodes.
+
+Usage:
+    fleet_snapshot (-p PARTITION | -w NODELIST) [-A ACCOUNT] [--gres GRES]
+                   [--timeout MIN] [--out DIR] [--json]
+    fleet_snapshot --from-dir DIR [--json]     # re-aggregate offline
+
+Exit codes: 0 fleet clean, 1 anomalies (incl. unreached nodes), 3 setup error.
+"""
+
+import argparse
+import collections
+import json
+import os
+import re
+import sys
+
+TOOL = "fleet_snapshot"
+
+# Error-class counters (same list counter_delta.sh watches).
+ERROR_COUNTERS = ("symbol_error", "link_downed", "port_xmit_discards",
+                  "port_rcv_errors", "port_rcv_remote_physical_errors",
+                  "local_link_integrity_errors",
+                  "excessive_buffer_overrun_errors")
+
+_FW_RE = re.compile(r"fw_ver:\s*(\S+)")
+_NUM_RE = re.compile(r"\d+(\.\d+)?")
+
+
+def _rate_gbps(text):
+    """'400 Gb/sec (4X NDR)' -> 400.0; None when absent/unparseable."""
+    if not text:
+        return None
+    m = _NUM_RE.search(text)
+    return float(m.group()) if m else None
+
+
+def _kernel(snap):
+    parts = ((snap.get("system") or {}).get("uname") or "").split()
+    return parts[2] if len(parts) > 2 else None
+
+
+def _driver(snap):
+    return (snap.get("system") or {}).get("nvidia_driver")
+
+
+def _fw(snap):
+    """Sorted unique fw_ver strings across HCAs, joined; None if none found."""
+    versions = set()
+    for hca in ((snap.get("ib") or {}).get("hcas") or []):
+        versions.update(_FW_RE.findall(hca.get("ibv_devinfo") or ""))
+    return ",".join(sorted(versions)) if versions else None
+
+
+def _ports(snap):
+    """Yield (hca_name, port_number, port_dict) for every port."""
+    for hca in ((snap.get("ib") or {}).get("hcas") or []):
+        for port in (hca.get("ports") or []):
+            yield hca.get("name"), port.get("port"), port
+
+
+def _version_drift(reached, label, getter):
+    per_host = dict((h, getter(s)) for h, s in reached.items()
+                    if getter(s) is not None)
+    if len(set(per_host.values())) <= 1:
+        return []
+    modal = collections.Counter(per_host.values()).most_common(1)[0][0]
+    return sorted("%s: %s=%s (fleet modal: %s)" % (host, label, val, modal)
+                  for host, val in per_host.items() if val != modal)
+
+
+def aggregate(snapshots):
+    """Aggregate {host: snapshot-dict or None (unreached)} into a summary."""
+    reached = dict((h, s) for h, s in snapshots.items() if s)
+    summary = {
+        "nodes_total": len(snapshots),
+        "nodes_reached": len(reached),
+        "unreached": sorted(h for h, s in snapshots.items() if not s),
+        "unavailable": [],
+        "version_drift": [],
+        "link_anomalies": [],
+        "error_counters": [],
+    }
+
+    for label, getter in (("driver", _driver), ("kernel", _kernel),
+                          ("fw", _fw)):
+        summary["version_drift"].extend(_version_drift(reached, label, getter))
+
+    rates = collections.defaultdict(dict)  # (hca, port) -> {host: gbps}
+    for host in sorted(reached):
+        snap = reached[host]
+        ib = snap.get("ib") or {}
+        if not ib.get("hcas"):
+            summary["unavailable"].append(
+                "%s: ib section unavailable (%s)"
+                % (host, ib.get("error", "no hcas")))
+            continue
+        for hca, portno, port in _ports(snap):
+            where = "%s %s/port%s" % (host, hca, portno)
+            state = port.get("state")
+            if state and "ACTIVE" not in state:
+                summary["link_anomalies"].append(
+                    "%s: state=%s" % (where, state))
+            phys = port.get("phys_state")
+            if phys and "LinkUp" not in phys:
+                summary["link_anomalies"].append(
+                    "%s: phys_state=%s" % (where, phys))
+            gbps = _rate_gbps(port.get("rate"))
+            if gbps is not None:
+                rates[(hca, portno)][host] = gbps
+            counters = port.get("counters") or {}
+            for name in ERROR_COUNTERS:
+                value = counters.get(name)
+                if value:
+                    summary["error_counters"].append(
+                        "%s: %s=%d" % (where, name, value))
+
+    for (hca, portno), per_host in sorted(rates.items()):
+        if len(set(per_host.values())) <= 1:
+            continue
+        modal = collections.Counter(per_host.values()).most_common(1)[0][0]
+        for host, gbps in sorted(per_host.items()):
+            if gbps < modal:
+                summary["link_anomalies"].append(
+                    "%s %s/port%s: rate=%g Gb/s below fleet modal %g Gb/s"
+                    % (host, hca, portno, gbps, modal))
+
+    summary["clean"] = not (summary["unreached"] or summary["unavailable"]
+                            or summary["version_drift"]
+                            or summary["link_anomalies"]
+                            or summary["error_counters"])
+    return summary
+
+
+def render_fleet_text(summary):
+    lines = ["fleet_snapshot: %d/%d nodes reached"
+             % (summary["nodes_reached"], summary["nodes_total"]), ""]
+    for key, title in (("unreached", "Unreached nodes"),
+                       ("unavailable", "Unavailable data"),
+                       ("version_drift", "Version drift"),
+                       ("link_anomalies", "Link anomalies"),
+                       ("error_counters", "Error counters")):
+        items = summary[key]
+        if items:
+            lines.append("%s (%d):" % (title, len(items)))
+            lines.extend("  " + item for item in items)
+            lines.append("")
+    lines.append("fleet verdict: %s"
+                 % ("CLEAN" if summary["clean"] else "ANOMALIES"))
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    sys.exit(0)  # main() arrives in Task 2
