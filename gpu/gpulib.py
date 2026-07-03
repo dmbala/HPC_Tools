@@ -40,11 +40,18 @@ def _get(prom, path, params, timeout, kind):
     if resp.status_code != 200:
         raise RuntimeError("prometheus %s failed: HTTP %d"
                            % (kind, resp.status_code))
-    payload = resp.json()
-    if payload.get("status") != "success":
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError("prometheus %s failed: non-JSON response" % kind)
+    if not isinstance(payload, dict) or payload.get("status") != "success":
         raise RuntimeError("prometheus %s failed: %s"
-                           % (kind, payload.get("error", "non-success")))
-    return payload["data"]["result"]
+                           % (kind, payload.get("error", "non-success")
+                              if isinstance(payload, dict) else "bad payload"))
+    try:
+        return payload["data"]["result"]
+    except (KeyError, TypeError):
+        raise RuntimeError("prometheus %s failed: malformed response" % kind)
 
 
 def query(prom, promql, when=None, timeout=60):

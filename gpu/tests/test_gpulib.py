@@ -68,5 +68,47 @@ class TestLoadBundle(unittest.TestCase):
         self.assertEqual(cm.exception.code, 3)
 
 
+class TestGetGuards(unittest.TestCase):
+    def _fake_requests(self, body_text, status=200):
+        import types
+        fake = types.ModuleType("requests")
+
+        class Resp(object):
+            status_code = status
+
+            def json(self):
+                json_mod = __import__("json")
+                return json_mod.loads(body_text)
+
+        class RequestException(Exception):
+            pass
+
+        fake.RequestException = RequestException
+        fake.get = lambda *a, **kw: Resp()
+        return fake
+
+    def test_non_json_body_raises_runtimeerror(self):
+        sys_mod = __import__("sys")
+        sys_mod.modules["requests"] = self._fake_requests("<html>oops")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                gl.query("http://x", "up")
+            self.assertIn("non-JSON", str(cm.exception))
+            self.assertNotIn("http://x", str(cm.exception))
+        finally:
+            del sys_mod.modules["requests"]
+
+    def test_malformed_success_payload_raises_runtimeerror(self):
+        sys_mod = __import__("sys")
+        sys_mod.modules["requests"] = self._fake_requests(
+            '{"status": "success"}')
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                gl.query("http://x", "up")
+            self.assertIn("malformed", str(cm.exception))
+        finally:
+            del sys_mod.modules["requests"]
+
+
 if __name__ == "__main__":
     unittest.main()
