@@ -1,0 +1,8 @@
+Account|User|RawShares|NormShares|RawUsage|EffectvUsage|FairShare
+root|||1.000000|153274818272|1.000000|
+ alpha_lab||250|0.000409|22|0.000000|
+ beta_lab||912|0.001492|8175000000|0.010000|
+ gamma_lab||500|0.000818|125000000000|0.815000|
+  gamma_lab|gina|1|0.000100|125000000000|0.815000|0.150000
+ delta_lab||500|0.000818|0|0.000000|
+not|a|row
