@@ -181,6 +181,11 @@ class TestCliFromDir(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         self.assertIn("error", proc.stderr.lower())
 
+    def test_nonexistent_from_dir_exits_3(self):
+        proc = run_cli("--from-dir", "/nonexistent-fleet-dir")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

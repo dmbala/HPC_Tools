@@ -243,7 +243,7 @@ def main(argv=None):
                         snapshots[node] = json.load(fh)
                 except (OSError, ValueError):
                     snapshots[node] = None
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         fablib.err_exit(TOOL, str(exc))
 
     summary = aggregate(snapshots)
