@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""xid_history -- window report of GPU XID errors fleet-wide, each mapped to
+the node, GPU, and the Slurm job/user holding the GPU at the time.
+
+Reads DCGM_FI_DEV_XID_ERRORS from the same Prometheus the jobstats stack
+feeds (endpoint from the jobstats config module), joins to jobs via the
+nvidia_gpu_jobId series (UUID match), and enriches with one batched sacct
+call. Runs wherever jobstats is installed -- no allocation needed.
+
+Usage:
+    xid_history [--days N | --since ISO --until ISO] [--node NODE] [--json]
+
+Exit codes: 0 no XIDs in the window, 1 XIDs found, 3 probe/setup error.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import gpulib
+
+TOOL = "xid_history"
+STEP_S = 300      # range-query resolution
+GAP_STEPS = 2     # samples further apart than this many steps split episodes
+
+
+def episodes(matrix, step_s=STEP_S, gap_steps=GAP_STEPS):
+    """Compress a query_range matrix of nonzero XID samples into episodes,
+    one per burst per (node, gpu, err_code), sorted by first_seen."""
+    out = []
+    for series in matrix:
+        labels = series.get("metric", {})
+        node = labels.get("Hostname") or labels.get("host") or "?"
+        template = {"node": node, "gpu": labels.get("gpu", "?"),
+                    "uuid": gpulib.series_uuid(labels),
+                    "err_code": labels.get("err_code", "?"),
+                    "err_msg": labels.get("err_msg", "")}
+        current = None
+        for ts, _val in series.get("values", []):
+            ts = float(ts)
+            if current and ts - current["last_seen"] <= gap_steps * step_s:
+                current["last_seen"] = ts
+            else:
+                current = dict(template, first_seen=ts, last_seen=ts,
+                               jobid=None, user=None, state=None)
+                out.append(current)
+    out.sort(key=lambda e: e["first_seen"])
+    return out
+
+
+def attach_jobids(eps, jobid_by_ts):
+    """Fill each episode's jobid from {str(int(first_seen)): instant result}.
+    Job id 0 (unallocated GPU) stays None."""
+    for ep in eps:
+        for series in jobid_by_ts.get(str(int(ep["first_seen"])), []):
+            if gpulib.series_uuid(series.get("metric", {})) != ep["uuid"]:
+                continue
+            try:
+                jid = int(float(series["value"][1]))
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+            if jid > 0:
+                ep["jobid"] = jid
+            break
+    return eps
+
+
+def attach_sacct(eps, sacct_text):
+    """Fill user/state from 'JobIDRaw|User|Account|State' -P rows."""
+    info = {}
+    for line in (sacct_text or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) >= 4 and parts[0].isdigit():
+            info[int(parts[0])] = (parts[1], parts[3])
+    for ep in eps:
+        if ep["jobid"] in info:
+            ep["user"], ep["state"] = info[ep["jobid"]]
+    return eps
+
+
+def _fmt(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def render(eps, start, end):
+    lines = ["xid_history: %s -> %s" % (_fmt(start), _fmt(end)), ""]
+    if not eps:
+        lines.append("no XID errors in the window")
+        return "\n".join(lines)
+    row = "%-17s %-17s %-16s %-4s %-5s %-10s %-10s %-10s %s"
+    lines.append(row % ("FIRST_SEEN", "LAST_SEEN", "NODE", "GPU", "XID",
+                        "JOB", "USER", "STATE", "MESSAGE"))
+    for ep in eps:
+        lines.append(row % (_fmt(ep["first_seen"]), _fmt(ep["last_seen"]),
+                            ep["node"].split(".")[0], ep["gpu"],
+                            ep["err_code"], ep["jobid"] or "-",
+                            ep["user"] or "-", ep["state"] or "-",
+                            ep["err_msg"]))
+    lines.append("")
+    lines.append("%d episode(s) on %d node(s)"
+                 % (len(eps), len(set(e["node"] for e in eps))))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="window report of GPU XID errors mapped to jobs/users "
+                    "(exit 0 none, 1 found, 3 error)")
+    gpulib.add_window_args(parser)
+    parser.add_argument("--node", help="restrict to one node (Hostname)")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--from-json", metavar="FILE",
+                        help="replay a captured query bundle (testing)")
+    args = parser.parse_args(argv)
+    start, end = gpulib.parse_window(args, TOOL)
+
+    if args.from_json:
+        bundle = gpulib.load_bundle(args.from_json, TOOL)
+        eps = episodes(bundle.get("xid", []))
+        attach_jobids(eps, bundle.get("jobid", {}))
+        attach_sacct(eps, bundle.get("sacct", ""))
+    else:
+        prom = gpulib.load_prom_server(TOOL)
+        selector = '{Hostname="%s"}' % args.node if args.node else ""
+        try:
+            matrix = gpulib.query_range(
+                prom, "DCGM_FI_DEV_XID_ERRORS%s != 0" % selector,
+                start, end, STEP_S)
+        except RuntimeError as exc:
+            gpulib.err_exit(TOOL, str(exc))
+        eps = episodes(matrix)
+        jobid_by_ts = {}
+        try:
+            for ts in sorted(set(int(e["first_seen"]) for e in eps)):
+                jobid_by_ts[str(ts)] = gpulib.query(prom, "nvidia_gpu_jobId",
+                                                    when=ts)
+        except RuntimeError as exc:
+            print("warning: job attribution unavailable: %s" % exc)
+        attach_jobids(eps, jobid_by_ts)
+        jobids = sorted(set(e["jobid"] for e in eps if e["jobid"]))
+        if jobids:
+            try:
+                r = subprocess.run(
+                    ["sacct", "-j", ",".join(str(j) for j in jobids), "-X",
+                     "-n", "-P", "-o", "JobIDRaw,User,Account,State"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    universal_newlines=True, timeout=120)
+                if r.returncode == 0:
+                    attach_sacct(eps, r.stdout)
+                else:
+                    print("warning: sacct lookup failed; USER/STATE omitted")
+            except (OSError, subprocess.TimeoutExpired):
+                print("warning: sacct unavailable; USER/STATE omitted")
+
+    if args.json:
+        print(json.dumps({"start": start, "end": end, "episodes": eps},
+                         indent=2))
+    else:
+        print(render(eps, start, end))
+    return 1 if eps else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
