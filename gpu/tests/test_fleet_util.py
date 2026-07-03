@@ -104,6 +104,11 @@ class TestCli(unittest.TestCase):
                        "--partition", "nope")
         self.assertEqual(proc.returncode, 3)
 
+    def test_zero_step_exits_3(self):
+        proc = run_cli("--from-json", self.bundle_path(), "--step", "0")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("fleet_util: error:", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

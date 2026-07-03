@@ -140,12 +140,15 @@ def main(argv=None):
                         help="wasted when SM_ACT%% is below this (default 10)")
     parser.add_argument("--step", type=float, default=1.0,
                         help="sample step in hours (default 1)")
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
     parser.add_argument("--from-json", metavar="FILE",
                         help="replay a captured query bundle (testing)")
     args = parser.parse_args(argv)
     start, end = gpulib.parse_window(args, TOOL)
     step_s = int(args.step * 3600)
+    if step_s < 60:
+        gpulib.err_exit(TOOL, "--step must be at least 0.0167 hours (60s)")
 
     if args.from_json:
         bundle = gpulib.load_bundle(args.from_json, TOOL)

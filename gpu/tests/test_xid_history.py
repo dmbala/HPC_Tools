@@ -48,6 +48,14 @@ class TestEpisodes(unittest.TestCase):
     def test_empty_matrix(self):
         self.assertEqual(xh.episodes([]), [])
 
+    def test_unsorted_samples_still_split(self):
+        m = [{"metric": {"Hostname": "n", "UUID": "GPU-d", "gpu": "0",
+                         "err_code": "31", "err_msg": "m"},
+              "values": [[2400, "31"], [0, "31"], [300, "31"]]}]
+        eps = xh.episodes(m)
+        self.assertEqual(len(eps), 2)
+        self.assertEqual(eps[0]["last_seen"], 300.0)
+
 
 class TestAttach(unittest.TestCase):
     def test_jobid_matched_on_uuid(self):
@@ -72,6 +80,12 @@ class TestAttach(unittest.TestCase):
         self.assertEqual(eps[0]["user"], "alice")
         self.assertEqual(eps[0]["state"], "FAILED")
         self.assertIsNone(eps[1]["user"])
+
+    def test_sacct_state_normalized(self):
+        eps = xh.episodes(matrix())
+        eps[0]["jobid"] = 27400001
+        xh.attach_sacct(eps, "27400001|alice|kempner_lab|CANCELLED by 123\n")
+        self.assertEqual(eps[0]["state"], "CANCELLED")
 
 
 class TestRender(unittest.TestCase):

@@ -40,7 +40,8 @@ def episodes(matrix, step_s=STEP_S, gap_steps=GAP_STEPS):
                     "err_code": labels.get("err_code", "?"),
                     "err_msg": labels.get("err_msg", "")}
         current = None
-        for ts, _val in series.get("values", []):
+        for ts, _val in sorted(series.get("values", []),
+                               key=lambda v: float(v[0])):
             ts = float(ts)
             if current and ts - current["last_seen"] <= gap_steps * step_s:
                 current["last_seen"] = ts
@@ -75,7 +76,8 @@ def attach_sacct(eps, sacct_text):
     for line in (sacct_text or "").splitlines():
         parts = line.strip().split("|")
         if len(parts) >= 4 and parts[0].isdigit():
-            info[int(parts[0])] = (parts[1], parts[3])
+            info[int(parts[0])] = (parts[1],
+                                   parts[3].split()[0] if parts[3] else "")
     for ep in eps:
         if ep["jobid"] in info:
             ep["user"], ep["state"] = info[ep["jobid"]]
@@ -113,7 +115,8 @@ def main(argv=None):
                     "(exit 0 none, 1 found, 3 error)")
     gpulib.add_window_args(parser)
     parser.add_argument("--node", help="restrict to one node (Hostname)")
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
     parser.add_argument("--from-json", metavar="FILE",
                         help="replay a captured query bundle (testing)")
     args = parser.parse_args(argv)
@@ -126,7 +129,10 @@ def main(argv=None):
         attach_sacct(eps, bundle.get("sacct", ""))
     else:
         prom = gpulib.load_prom_server(TOOL)
-        selector = '{Hostname="%s"}' % args.node if args.node else ""
+        selector = ""
+        if args.node:
+            node = args.node.replace("\\", "\\\\").replace('"', '\\"')
+            selector = '{Hostname="%s"}' % node
         try:
             matrix = gpulib.query_range(
                 prom, "DCGM_FI_DEV_XID_ERRORS%s != 0" % selector,
@@ -140,7 +146,8 @@ def main(argv=None):
                 jobid_by_ts[str(ts)] = gpulib.query(prom, "nvidia_gpu_jobId",
                                                     when=ts)
         except RuntimeError as exc:
-            print("warning: job attribution unavailable: %s" % exc)
+            sys.stderr.write("warning: job attribution unavailable: %s\n"
+                             % exc)
         attach_jobids(eps, jobid_by_ts)
         jobids = sorted(set(e["jobid"] for e in eps if e["jobid"]))
         if jobids:
@@ -153,9 +160,11 @@ def main(argv=None):
                 if r.returncode == 0:
                     attach_sacct(eps, r.stdout)
                 else:
-                    print("warning: sacct lookup failed; USER/STATE omitted")
+                    sys.stderr.write(
+                        "warning: sacct unavailable; USER/STATE omitted\n")
             except (OSError, subprocess.TimeoutExpired):
-                print("warning: sacct unavailable; USER/STATE omitted")
+                sys.stderr.write(
+                    "warning: sacct unavailable; USER/STATE omitted\n")
 
     if args.json:
         print(json.dumps({"start": start, "end": end, "episodes": eps},

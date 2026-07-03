@@ -7,6 +7,9 @@ max_over_time - min_over_time across the job's window, joined to the job's
 GPUs the same way jobstats_dcgm does (nvidia_gpu_jobId -> UUID). Runs
 wherever jobstats is installed -- no allocation needed. Report-only.
 
+Caveat: a mid-job GPU driver reload resets the counter and skews that
+job's delta; treat per-job values as estimates.
+
 Usage:
     energy_report (-u USER | -A ACCOUNT)
                   [--days N | --since ISO --until ISO]
@@ -19,6 +22,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -169,12 +173,15 @@ def main(argv=None):
     parser.add_argument("--max-jobs", type=int, default=200, dest="max_jobs",
                         help="cap on per-job Prometheus queries "
                              "(default 200; truncation is reported)")
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
     parser.add_argument("--from-json", metavar="FILE",
                         help="replay a captured query bundle (testing)")
     args = parser.parse_args(argv)
     if bool(args.user) == bool(args.account):
         gpulib.err_exit(TOOL, "exactly one of -u USER or -A ACCOUNT required")
+    if args.max_jobs < 0 or args.top < 0:
+        gpulib.err_exit(TOOL, "--max-jobs and --top must be >= 0")
     start, end = gpulib.parse_window(args, TOOL)
 
     discovery = energy = None
@@ -230,7 +237,7 @@ def main(argv=None):
         if args.from_json:
             eres = energy.get(jid, [])
         else:
-            rx = "|".join(uuids)
+            rx = "|".join(re.escape(u) for u in uuids)
             promql = ("(max_over_time(DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION"
                       "{UUID=~\"%s\"}[%ds:]) - min_over_time("
                       "DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION{UUID=~\"%s\"}"

@@ -123,6 +123,12 @@ class TestCli(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("skipped by --max-jobs: 1", proc.stdout)
 
+    def test_negative_max_jobs_exits_3(self):
+        proc = run_cli("-u", "alice", "--max-jobs", "-1", "--from-json",
+                       self.bundle_path(loader.fixture("sacct_energy.txt")))
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("energy_report: error:", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
