@@ -1,0 +1,16 @@
+# nThread 1 nGpus 1 minBytes 8 maxBytes 1073741824 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 100 on nodea device  0 [0x19] NVIDIA H200
+#  Rank  1 Group  0 Pid 101 on nodea device  1 [0x3b] NVIDIA H200
+#
+#                                                              out-of-place                       in-place
+#       size         count      type   redop    root     time   algbw   busbw #wrong     time   algbw   busbw #wrong
+#        (B)    (elements)                                 (us)  (GB/s)  (GB/s)            (us)  (GB/s)  (GB/s)
+           8             2     float     sum      -1    21.63    0.00    0.00      0    20.87    0.00    0.00      0
+        1024           256     float     sum      -1    22.30    0.05    0.09      0    21.94    0.05    0.09      0
+     1048576        262144     float     sum      -1    45.10   23.25   43.59      0    44.80   23.41   43.89      0
+   134217728      33554432     float     sum      -1   823.50  163.00  305.62      0   820.10  163.66  306.87      0
+  1073741824     268435456     float     sum      -1  6120.00  175.45  329.00      0  6100.00  176.02  330.07      0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 145.2

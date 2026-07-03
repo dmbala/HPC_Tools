@@ -1,0 +1,197 @@
+"""Tests for fabric/fleet_snapshot (aggregator core; CLI tested in Task 2)."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from fabric.tests import loader
+
+fs = loader.load_tool("fleet_snapshot")
+
+
+def snap(name):
+    return json.loads(loader.fixture(name))
+
+
+def clean_pair():
+    return {"nodea": snap("snapshot_nodea.json"),
+            "nodeb": snap("snapshot_nodeb.json")}
+
+
+class TestRateGbps(unittest.TestCase):
+    def test_parses_leading_number(self):
+        self.assertEqual(fs._rate_gbps("400 Gb/sec (4X NDR)"), 400.0)
+        self.assertEqual(fs._rate_gbps("100 Gb/sec (4X EDR)"), 100.0)
+
+    def test_none_on_garbage(self):
+        self.assertIsNone(fs._rate_gbps(""))
+        self.assertIsNone(fs._rate_gbps(None))
+        self.assertIsNone(fs._rate_gbps("unknown"))
+
+
+class TestAggregate(unittest.TestCase):
+    def test_clean_fleet(self):
+        summary = fs.aggregate(clean_pair())
+        self.assertTrue(summary["clean"])
+        self.assertEqual(summary["nodes_total"], 2)
+        self.assertEqual(summary["nodes_reached"], 2)
+        self.assertEqual(summary["unreached"], [])
+        self.assertEqual(summary["version_drift"], [])
+        self.assertEqual(summary["link_anomalies"], [])
+        self.assertEqual(summary["error_counters"], [])
+        self.assertEqual(summary["unavailable"], [])
+
+    def test_unreached_node_flagged(self):
+        snaps = clean_pair()
+        snaps["nodec"] = None
+        summary = fs.aggregate(snaps)
+        self.assertFalse(summary["clean"])
+        self.assertEqual(summary["unreached"], ["nodec"])
+        self.assertEqual(summary["nodes_reached"], 2)
+
+    def test_driver_drift_flagged(self):
+        snaps = clean_pair()
+        snaps["nodeb"]["system"]["nvidia_driver"] = "550.54.15"
+        summary = fs.aggregate(snaps)
+        self.assertFalse(summary["clean"])
+        self.assertTrue(any("nodeb" in d and "driver" in d
+                            for d in summary["version_drift"]), summary)
+
+    def test_fw_drift_flagged(self):
+        snaps = clean_pair()
+        snaps["nodeb"]["ib"]["hcas"][0]["ibv_devinfo"] = (
+            "hca_id:\tmlx5_0\n\tfw_ver:\t28.36.1010\n")
+        summary = fs.aggregate(snaps)
+        self.assertTrue(any("fw" in d for d in summary["version_drift"]), summary)
+
+    def test_down_port_flagged(self):
+        snaps = clean_pair()
+        port = snaps["nodeb"]["ib"]["hcas"][0]["ports"][0]
+        port["state"] = "1: DOWN"
+        port["phys_state"] = "3: Disabled"
+        summary = fs.aggregate(snaps)
+        self.assertFalse(summary["clean"])
+        self.assertTrue(any("nodeb" in a and "state" in a
+                            for a in summary["link_anomalies"]), summary)
+
+    def test_degraded_rate_flagged(self):
+        snaps = clean_pair()
+        snaps["nodeb"]["ib"]["hcas"][0]["ports"][0]["rate"] = \
+            "200 Gb/sec (4X HDR)"
+        summary = fs.aggregate(snaps)
+        self.assertTrue(any("rate" in a and "nodeb" in a
+                            for a in summary["link_anomalies"]), summary)
+
+    def test_error_counter_flagged(self):
+        snaps = clean_pair()
+        snaps["nodea"]["ib"]["hcas"][0]["ports"][0]["counters"]["symbol_error"] = 12
+        summary = fs.aggregate(snaps)
+        self.assertFalse(summary["clean"])
+        self.assertTrue(any("symbol_error=12" in e and "nodea" in e
+                            for e in summary["error_counters"]), summary)
+
+    def test_traffic_counters_ignored(self):
+        # port_xmit_data differs between the fixtures and is NOT an error counter
+        summary = fs.aggregate(clean_pair())
+        self.assertEqual(summary["error_counters"], [])
+
+    def test_missing_ib_section_noted(self):
+        snaps = clean_pair()
+        snaps["nodeb"]["ib"] = {"error": "no /sys/class/infiniband", "hcas": []}
+        summary = fs.aggregate(snaps)
+        self.assertFalse(summary["clean"])
+        self.assertTrue(any("nodeb" in u for u in summary["unavailable"]), summary)
+
+    def test_port_xmit_wait_not_gated(self):
+        snaps = clean_pair()
+        snaps["nodea"]["ib"]["hcas"][0]["ports"][0]["counters"]["port_xmit_wait"] = 999999
+        summary = fs.aggregate(snaps)
+        self.assertTrue(summary["clean"])
+
+
+class TestRenderFleetText(unittest.TestCase):
+    def test_clean_report(self):
+        text = fs.render_fleet_text(fs.aggregate(clean_pair()))
+        self.assertIn("fleet verdict: CLEAN", text)
+        self.assertIn("2/2", text)
+
+    def test_anomalous_report_lists_findings(self):
+        snaps = clean_pair()
+        snaps["nodeb"]["ib"]["hcas"][0]["ports"][0]["counters"]["symbol_error"] = 3
+        text = fs.render_fleet_text(fs.aggregate(snaps))
+        self.assertIn("fleet verdict: ANOMALIES", text)
+        self.assertIn("symbol_error=3", text)
+
+
+TOOL_PATH = os.path.abspath(os.path.join(loader.HERE, "..", "fleet_snapshot"))
+
+
+def run_cli(*argv):
+    return subprocess.run([sys.executable, TOOL_PATH] + list(argv),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+
+class TestCliFromDir(unittest.TestCase):
+    def make_dir(self, doctor=None):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        for name in ("snapshot_nodea.json", "snapshot_nodeb.json"):
+            data = json.loads(loader.fixture(name))
+            if doctor:
+                doctor(data)
+            host = data["hostname"]
+            with open(os.path.join(tmp, host + ".json"), "w") as fh:
+                json.dump(data, fh)
+        return tmp
+
+    def test_clean_dir_exits_0(self):
+        proc = run_cli("--from-dir", self.make_dir())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("fleet verdict: CLEAN", proc.stdout)
+
+    def test_anomalous_dir_exits_1(self):
+        def doctor(data):
+            if data["hostname"] == "nodeb":
+                data["system"]["nvidia_driver"] = "550.54.15"
+        proc = run_cli("--from-dir", self.make_dir(doctor))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("fleet verdict: ANOMALIES", proc.stdout)
+
+    def test_json_output(self):
+        proc = run_cli("--from-dir", self.make_dir(), "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertTrue(summary["clean"])
+
+    def test_corrupt_file_counts_unreached(self):
+        d = self.make_dir()
+        with open(os.path.join(d, "nodec.json"), "w") as fh:
+            fh.write("{not json")
+        proc = run_cli("--from-dir", d)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nodec", proc.stdout)
+
+    def test_empty_dir_exits_3(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        proc = run_cli("--from-dir", tmp)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
+
+    def test_missing_target_args_exits_3(self):
+        proc = run_cli()
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
+
+    def test_nonexistent_from_dir_exits_3(self):
+        proc = run_cli("--from-dir", "/nonexistent-fleet-dir")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("fleet_snapshot: error:", proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""ib_bw_pair -- point-to-point RDMA bandwidth test between two nodes.
+
+Usage:
+    ib_bw_pair -A ACCOUNT -p PARTITION -w NODEA,NODEB [--test write|read]
+               [--device DEV] [--min-gbps N] [--timeout MIN]
+
+Submits one 2-node Slurm job: perftest server on node A, client on node B
+(ib_write_bw / ib_read_bw -a --report_gbits). Verdict: --min-gbps if given,
+else BW average >= RATE_FRACTION (0.8) of the server port's sysfs rate;
+REPORT-only if the rate is unavailable.
+
+Exit codes: 0 pass/report, 1 below threshold, 3 setup/parse error.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fablib
+
+TOOL = "ib_bw_pair"
+RATE_FRACTION = 0.8  # default pass threshold as a fraction of port rate
+_NUM_RE = re.compile(r"\d+(\.\d+)?")
+_UNIT_RE = re.compile(r"BW average\[(\w+)/sec\]")
+
+
+def _rate_gbps(text):
+    if not text:
+        return None
+    m = _NUM_RE.search(text)
+    return float(m.group()) if m else None
+
+
+def parse_perftest(text):
+    """perftest client output -> largest-size row dict, or None."""
+    unit = None
+    rows = []
+    for line in (text or "").splitlines():
+        m = _UNIT_RE.search(line)
+        if m:
+            unit = m.group(1)
+            continue
+        parts = line.split()
+        if len(parts) == 5 and unit:
+            try:
+                rows.append({"bytes": int(parts[0]),
+                             "bw_peak": float(parts[2]),
+                             "bw_avg": float(parts[3]),
+                             "msg_rate_mpps": float(parts[4])})
+            except ValueError:
+                continue
+    if not rows:
+        return None
+    largest = max(rows, key=lambda r: r["bytes"])
+    factor = 1.0 if unit == "Gb" else 8.0 / 1000.0  # MB/sec -> Gb/sec
+    return {"bytes": largest["bytes"],
+            "bw_peak_gbps": largest["bw_peak"] * factor,
+            "bw_avg_gbps": largest["bw_avg"] * factor,
+            "msg_rate_mpps": largest["msg_rate_mpps"]}
+
+
+def verdict(bw_avg_gbps, min_gbps, rate_gbps):
+    """-> ('PASS'|'FAIL'|'REPORT', reason)."""
+    if min_gbps is not None:
+        ok = bw_avg_gbps >= min_gbps
+        return ("PASS" if ok else "FAIL",
+                "threshold %.1f Gb/s (explicit)" % min_gbps)
+    if rate_gbps is not None:
+        threshold = RATE_FRACTION * rate_gbps
+        ok = bw_avg_gbps >= threshold
+        return ("PASS" if ok else "FAIL",
+                "threshold %.1f Gb/s (%.0f%% of port rate %.0f Gb/s)"
+                % (threshold, RATE_FRACTION * 100, rate_gbps))
+    return ("REPORT", "no --min-gbps and port rate unavailable")
+
+
+def _job_script(test_bin, device, outdir):
+    dev_flag = "-d %s" % device if device else ""
+    dev_dir = device if device else "$(ls /sys/class/infiniband | head -1)"
+    return """#!/bin/bash
+set -u
+NODES=($(scontrol show hostnames $SLURM_JOB_NODELIST))
+A=${NODES[0]}; B=${NODES[1]}
+srun -w $A -N1 -n1 --overlap bash -c \
+  'cat /sys/class/infiniband/%s/ports/1/rate' > %s/rate.txt 2>/dev/null
+srun -w $A -N1 -n1 --overlap %s -a --report_gbits %s > %s/server.log 2>&1 &
+sleep 5
+srun -w $B -N1 -n1 --overlap %s -a --report_gbits %s $A > %s/client.log 2>&1
+rc=$?
+wait
+exit $rc
+""" % (dev_dir, outdir, test_bin, dev_flag, outdir, test_bin, dev_flag,
+       outdir)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL, description="pairwise RDMA bandwidth test via Slurm "
+        "(exit 0 pass/report, 1 fail, 3 setup error)")
+    parser.add_argument("-A", "--account", required=True)
+    parser.add_argument("-p", "--partition", required=True)
+    parser.add_argument("-w", "--nodelist", required=True,
+                        help="exactly two nodes: nodeA,nodeB")
+    parser.add_argument("--test", choices=("write", "read"), default="write")
+    parser.add_argument("--device", help="HCA, e.g. mlx5_0")
+    parser.add_argument("--min-gbps", type=float)
+    parser.add_argument("--timeout", type=int, default=15,
+                        help="minutes (job limit and wait; default 15)")
+    args = parser.parse_args(argv)
+
+    try:
+        nodes = fablib.expand_nodes(nodelist=args.nodelist)
+    except RuntimeError as exc:
+        fablib.err_exit(TOOL, str(exc))
+    if len(nodes) != 2:
+        fablib.err_exit(TOOL, "need exactly two nodes, got %s" % nodes)
+
+    test_bin = "ib_%s_bw" % args.test
+    repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    runid = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    outdir = os.path.join(repo_root, "results", "ib_bw_pair_" + runid)
+    os.makedirs(outdir, exist_ok=True)
+
+    sbatch_args = ["-J", TOOL, "-A", args.account, "-p", args.partition,
+                   "-N", "2", "-w", ",".join(nodes), "-c", "2", "--mem=8G",
+                   "-t", str(args.timeout),
+                   "-o", os.path.join(outdir, "job.out")]
+    try:
+        job = fablib.submit_sbatch(
+            _job_script(test_bin, args.device, outdir), sbatch_args)
+        stragglers = fablib.wait_for_jobs({job}, args.timeout * 60 + 120)
+    except RuntimeError as exc:
+        fablib.err_exit(TOOL, str(exc))
+    if stragglers:
+        fablib.err_exit(TOOL, "job %s did not finish within --timeout "
+                        "(cancelled); see %s" % (job, outdir))
+
+    try:
+        with open(os.path.join(outdir, "client.log")) as fh:
+            client_out = fh.read()
+    except OSError as exc:
+        fablib.err_exit(TOOL, "no client output: %s" % exc)
+    rate_text = ""
+    try:
+        with open(os.path.join(outdir, "rate.txt")) as fh:
+            rate_text = fh.read()
+    except OSError:
+        pass
+
+    result = parse_perftest(client_out)
+    if not result:
+        fablib.err_exit(TOOL, "could not parse perftest output in "
+                        "%s/client.log" % outdir)
+    rate = _rate_gbps(rate_text)
+    status, reason = verdict(result["bw_avg_gbps"], args.min_gbps, rate)
+
+    print("ib_bw_pair: %s  %s -> %s%s"
+          % (test_bin, nodes[1], nodes[0],
+             "  (dev %s)" % args.device if args.device else ""))
+    print("  message size : %d bytes" % result["bytes"])
+    print("  BW average   : %.2f Gb/s (peak %.2f)"
+          % (result["bw_avg_gbps"], result["bw_peak_gbps"]))
+    if rate:
+        print("  port rate    : %.0f Gb/s" % rate)
+    print("verdict: %s (%s)" % (status, reason))
+    return 1 if status == "FAIL" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

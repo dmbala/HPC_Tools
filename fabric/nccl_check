@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""nccl_check -- NCCL all-reduce bandwidth smoke test via Slurm.
+
+Usage:
+    nccl_check -A ACCOUNT -p PARTITION [-N NODES] [-G GPUS_PER_NODE]
+               [-w NODELIST] [--min-busbw GBPS] [--binary PATH]
+               [--counters] [--timeout MIN]
+
+Runs all_reduce_perf (-b 8 -e 1G -f 2 -g 1, one task per GPU) in a fresh
+Slurm allocation and reports peak / large-message bus bandwidth. With
+--min-busbw it is a pass/fail gate on the large-message out-of-place busbw;
+without it, report-only. No built-in threshold: expected busbw depends on
+GPU generation and rail count (see README). --counters brackets the run
+with ib_snapshot + counter_delta on every node; any counter delta fails.
+
+Binary discovery: --binary, $NCCL_TESTS_BIN, all_reduce_perf on $PATH,
+then common install dirs.
+
+Exit codes: 0 pass/report, 1 below threshold or counter deltas, 3 setup error.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fablib
+
+TOOL = "nccl_check"
+COMMON_BINARY_DIRS = ("/usr/local/cuda/nccl-tests/build",
+                      "/opt/nccl-tests/build")
+_COUNTER_RE = re.compile(r"^COUNTER_DELTA (\S+) rc=(\d+)", re.MULTILINE)
+
+
+def find_binary(cli=None, env=None):
+    """Locate all_reduce_perf; returns a path or None."""
+    env = os.environ if env is None else env
+    if cli:
+        return cli if os.path.isfile(cli) else None
+    env_bin = env.get("NCCL_TESTS_BIN")
+    if env_bin:
+        return env_bin if os.path.isfile(env_bin) else None
+    on_path = shutil.which("all_reduce_perf", path=env.get("PATH"))
+    if on_path:
+        return on_path
+    for d in COMMON_BINARY_DIRS:
+        candidate = os.path.join(d, "all_reduce_perf")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def parse_nccl_table(text):
+    """nccl-tests output -> [{'size', 'oop_busbw', 'ip_busbw'}, ...]."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 13 or line.lstrip().startswith("#"):
+            continue
+        try:
+            rows.append({"size": int(parts[0]),
+                         "oop_busbw": float(parts[7]),
+                         "ip_busbw": float(parts[11])})
+        except ValueError:
+            continue
+    return rows
+
+
+def summarize(rows):
+    largest = max(rows, key=lambda r: r["size"])
+    return {"peak_busbw": max(r["oop_busbw"] for r in rows),
+            "large_busbw": largest["oop_busbw"],
+            "large_size": largest["size"]}
+
+
+def parse_counter_lines(text):
+    """Hosts whose in-job counter_delta reported a nonzero rc."""
+    return sorted(host for host, rc in _COUNTER_RE.findall(text or "")
+                  if int(rc) != 0)
+
+
+def _job_script(binary, gpn, counters, repo_root, outdir):
+    snapdir = "%s/counters" % outdir
+    lines = ["#!/bin/bash", "set -u"]
+    if counters:
+        lines += [
+            "mkdir -p %s" % snapdir,
+            "srun --ntasks-per-node=1 bash -c "
+            "'%s/fabric/ib_snapshot.sh %s/before_$(hostname -s).json'"
+            % (repo_root, snapdir),
+        ]
+    lines.append("srun --ntasks-per-node=%d --gpus-per-node=%d "
+                 "%s -b 8 -e 1G -f 2 -g 1" % (gpn, gpn, binary))
+    lines.append("rc=$?")
+    if counters:
+        lines += [
+            "srun --ntasks-per-node=1 bash -c "
+            "'%s/fabric/ib_snapshot.sh %s/after_$(hostname -s).json'"
+            % (repo_root, snapdir),
+            "for b in %s/before_*.json; do" % snapdir,
+            "  h=$(basename $b); h=${h#before_}; h=${h%.json}",
+            "  %s/fabric/counter_delta.sh $b %s/after_$h.json "
+            ">/dev/null 2>&1" % (repo_root, snapdir),
+            "  echo \"COUNTER_DELTA $h rc=$?\"",
+            "done",
+        ]
+    lines.append("exit $rc")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL, description="NCCL all-reduce smoke test via Slurm "
+        "(exit 0 pass/report, 1 fail, 3 setup error)")
+    parser.add_argument("-A", "--account", required=True)
+    parser.add_argument("-p", "--partition", required=True)
+    parser.add_argument("-N", "--nodes", type=int, default=1)
+    parser.add_argument("-G", "--gpus-per-node", type=int, default=4,
+                        dest="gpn")
+    parser.add_argument("-w", "--nodelist")
+    parser.add_argument("--min-busbw", type=float,
+                        help="GB/s; pass/fail gate on large-message busbw")
+    parser.add_argument("--binary", help="path to all_reduce_perf")
+    parser.add_argument("--counters", action="store_true",
+                        help="bracket with ib_snapshot + counter_delta")
+    parser.add_argument("--timeout", type=int, default=20,
+                        help="minutes (job time limit and wait; default 20)")
+    args = parser.parse_args(argv)
+
+    binary = find_binary(cli=args.binary)
+    if not binary:
+        fablib.err_exit(TOOL, "all_reduce_perf not found -- pass --binary "
+                        "PATH or set NCCL_TESTS_BIN to your nccl-tests build")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    runid = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    outdir = os.path.join(repo_root, "results", "nccl_check_" + runid)
+    os.makedirs(outdir, exist_ok=True)
+    outfile = os.path.join(outdir, "job.out")
+
+    sbatch_args = ["-J", TOOL, "-A", args.account, "-p", args.partition,
+                   "-N", str(args.nodes), "--gpus-per-node=%d" % args.gpn,
+                   "--ntasks-per-node=%d" % args.gpn,
+                   "-c", "8", "--mem=32G", "-t", str(args.timeout),
+                   "-o", outfile]
+    if args.nodelist:
+        sbatch_args += ["-w", args.nodelist]
+
+    try:
+        job = fablib.submit_sbatch(
+            _job_script(binary, args.gpn, args.counters, repo_root, outdir),
+            sbatch_args)
+        stragglers = fablib.wait_for_jobs({job}, args.timeout * 60 + 120)
+    except RuntimeError as exc:
+        fablib.err_exit(TOOL, str(exc))
+    if stragglers:
+        fablib.err_exit(TOOL, "job %s did not finish within --timeout "
+                        "(cancelled); partial output: %s" % (job, outfile))
+
+    try:
+        with open(outfile) as fh:
+            output = fh.read()
+    except OSError as exc:
+        fablib.err_exit(TOOL, "no job output: %s" % exc)
+
+    rows = parse_nccl_table(output)
+    if not rows:
+        fablib.err_exit(TOOL, "no nccl-tests result table in %s "
+                        "(job failed?)" % outfile)
+    summary = summarize(rows)
+    bad_hosts = parse_counter_lines(output) if args.counters else []
+
+    print("nccl_check: %d node(s) x %d GPU(s), binary %s"
+          % (args.nodes, args.gpn, binary))
+    print("  peak busbw          : %.2f GB/s" % summary["peak_busbw"])
+    print("  large-message busbw : %.2f GB/s (size %d)"
+          % (summary["large_busbw"], summary["large_size"]))
+    if args.counters:
+        print("  counter deltas      : %s"
+              % (", ".join(bad_hosts) if bad_hosts else "none"))
+
+    failed = False
+    if args.min_busbw is not None:
+        ok = summary["large_busbw"] >= args.min_busbw
+        print("verdict: %s (threshold %.2f GB/s)"
+              % ("PASS" if ok else "FAIL", args.min_busbw))
+        failed = not ok
+    else:
+        print("verdict: REPORT-ONLY (no --min-busbw given)")
+    if bad_hosts:
+        print("verdict: FAIL (fabric error counters advanced on: %s)"
+              % ", ".join(bad_hosts))
+        failed = True
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

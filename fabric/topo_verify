@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""topo_verify -- compare a node's current ib_snapshot against a blessed
+"golden" snapshot and report hardware/topology drift.
+
+Usage:
+    topo_verify [--golden FILE] [--current FILE] [--strict] [--json]
+    topo_verify --save-golden [--current FILE] [--golden FILE]
+
+Default golden: results/golden/<hostname>.json (hostname from the current
+snapshot). Without --current, a fresh snapshot is taken via ib_snapshot.sh
+(requires being on the node). Identity fields only are compared; volatile
+fields (counters, temps, clocks) are ignored. Driver/kernel/CUDA changes are
+informational and set exit 1 only with --strict.
+
+Exit codes: 0 match, 1 drift, 3 probe/setup error.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fablib
+
+TOOL = "topo_verify"
+_ROW_RE = re.compile(r"^(GPU|NIC|mlx)\S*", re.IGNORECASE)
+
+
+def _gpu_identity(snap):
+    gpus = (snap.get("gpus") or {}).get("gpus") or []
+    return [(g.get("index"), g.get("name"), g.get("pci_bus_id"))
+            for g in gpus]
+
+
+def _hca_ports(snap):
+    out = {}
+    for hca in ((snap.get("ib") or {}).get("hcas") or []):
+        for port in (hca.get("ports") or []):
+            key = "%s/port%s" % (hca.get("name"), port.get("port"))
+            out[key] = dict((f, port.get(f)) for f in
+                            ("state", "phys_state", "rate", "link_layer"))
+    return out
+
+
+def _mapping(snap):
+    mapping = (snap.get("ibdev2netdev") or {}).get("mapping") or []
+    return sorted((m.get("hca"), m.get("port"), m.get("netdev"))
+                  for m in mapping)
+
+
+def _topo_rows(snap):
+    raw = (snap.get("topology") or {}).get("raw") or ""
+    rows = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped and _ROW_RE.match(stripped):
+            rows.append(" ".join(stripped.split()))
+    return rows
+
+
+def _info_fields(snap):
+    system = snap.get("system") or {}
+    uname = (system.get("uname") or "").split()
+    return {
+        "driver": system.get("nvidia_driver"),
+        "kernel": uname[2] if len(uname) > 2 else None,
+        "cuda": system.get("cuda_runtime"),
+    }
+
+
+def compare(golden, current):
+    """Identity-field diff -> {'hardware': [...], 'informational': [...]}."""
+    hardware, informational = [], []
+
+    g_ib = (golden.get("ib") or {}).get("hcas")
+    c_ib = (current.get("ib") or {}).get("hcas")
+    if g_ib and not c_ib:
+        hardware.append("ib section unavailable in current snapshot (%s)"
+                        % (current.get("ib") or {}).get("error", "no hcas"))
+
+    g_gpus, c_gpus = _gpu_identity(golden), _gpu_identity(current)
+    if g_gpus != c_gpus:
+        hardware.append("gpu inventory: golden=%s current=%s"
+                        % (g_gpus, c_gpus))
+
+    g_ports, c_ports = _hca_ports(golden), _hca_ports(current)
+    for key in sorted(set(g_ports) | set(c_ports)):
+        if key not in c_ports:
+            if c_ib:  # already reported wholesale above when section missing
+                hardware.append("%s: missing in current snapshot" % key)
+            continue
+        if key not in g_ports:
+            hardware.append("%s: not present in golden snapshot" % key)
+            continue
+        for field in ("state", "phys_state", "rate", "link_layer"):
+            if g_ports[key][field] != c_ports[key][field]:
+                hardware.append("%s %s: golden=%s current=%s"
+                                % (key, field, g_ports[key][field],
+                                   c_ports[key][field]))
+
+    if _mapping(golden) != _mapping(current):
+        hardware.append("ibdev2netdev mapping: golden=%s current=%s"
+                        % (_mapping(golden), _mapping(current)))
+
+    if _topo_rows(golden) != _topo_rows(current):
+        hardware.append("topology matrix rows changed (golden vs current):\n"
+                        "    golden : %s\n    current: %s"
+                        % (_topo_rows(golden), _topo_rows(current)))
+
+    g_info, c_info = _info_fields(golden), _info_fields(current)
+    for field in sorted(g_info):
+        if g_info[field] != c_info[field]:
+            informational.append("%s: golden=%s current=%s"
+                                 % (field, g_info[field], c_info[field]))
+
+    return {"hardware": hardware, "informational": informational}
+
+
+def _take_snapshot():
+    """Run ib_snapshot.sh into a temp file; return the parsed dict."""
+    script = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "ib_snapshot.sh")
+    tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    tmp.close()
+    try:
+        r = fablib.run([script, tmp.name], timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError("ib_snapshot.sh failed: %s" % r.stderr.strip())
+        with open(tmp.name) as fh:
+            return json.load(fh)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def render_text(findings, strict):
+    lines = []
+    if findings["hardware"]:
+        lines.append("Hardware drift (%d):" % len(findings["hardware"]))
+        lines.extend("  " + f for f in findings["hardware"])
+    if findings["informational"]:
+        lines.append("Informational drift (%d)%s:"
+                     % (len(findings["informational"]),
+                        "" if strict else " (not counted without --strict)"))
+        lines.extend("  " + f for f in findings["informational"])
+    drift = findings["hardware"] or (strict and findings["informational"])
+    lines.append("topo_verify: %s" % ("DRIFT" if drift else "MATCH"))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="diff a node's snapshot against its golden snapshot "
+                    "(exit 0 match, 1 drift, 3 error)")
+    parser.add_argument("--golden", metavar="FILE",
+                        help="golden snapshot (default "
+                             "results/golden/<hostname>.json)")
+    parser.add_argument("--current", metavar="FILE",
+                        help="use an existing snapshot instead of probing")
+    parser.add_argument("--save-golden", action="store_true",
+                        help="bless the current snapshot as golden and exit")
+    parser.add_argument("--strict", action="store_true",
+                        help="informational drift also sets exit 1")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+    try:
+        if args.current:
+            with open(args.current) as fh:
+                current = json.load(fh)
+        else:
+            current = _take_snapshot()
+    except (OSError, ValueError, RuntimeError) as exc:
+        fablib.err_exit(TOOL, "cannot obtain current snapshot: %s" % exc)
+
+    golden_path = args.golden or os.path.join(
+        repo_root, "results", "golden",
+        "%s.json" % current.get("hostname", "unknown"))
+
+    if args.save_golden:
+        try:
+            golden_dir = os.path.dirname(golden_path)
+            if golden_dir:
+                os.makedirs(golden_dir, exist_ok=True)
+            with open(golden_path, "w") as fh:
+                json.dump(current, fh, indent=2)
+        except OSError as exc:
+            fablib.err_exit(TOOL, "cannot write golden: %s" % exc)
+        print("golden saved: %s" % golden_path)
+        return 0
+
+    try:
+        with open(golden_path) as fh:
+            golden = json.load(fh)
+    except (OSError, ValueError):
+        fablib.err_exit(TOOL, "no golden snapshot at %s -- bless one with: "
+                        "%s --save-golden" % (golden_path, TOOL))
+
+    findings = compare(golden, current)
+    if args.json:
+        print(json.dumps(findings, indent=2))
+    else:
+        print(render_text(findings, args.strict))
+    drift = findings["hardware"] or (args.strict and findings["informational"])
+    return 1 if drift else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
