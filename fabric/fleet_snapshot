@@ -21,10 +21,13 @@ import sys
 TOOL = "fleet_snapshot"
 
 # Error-class counters (same list counter_delta.sh watches).
-ERROR_COUNTERS = ("symbol_error", "link_downed", "port_xmit_discards",
+ERROR_COUNTERS = ("symbol_error", "link_downed", "link_error_recovery",
                   "port_rcv_errors", "port_rcv_remote_physical_errors",
+                  "port_rcv_switch_relay_errors", "port_xmit_discards",
+                  "port_xmit_constraint_errors", "port_rcv_constraint_errors",
                   "local_link_integrity_errors",
-                  "excessive_buffer_overrun_errors")
+                  "excessive_buffer_overrun_errors",
+                  "VL15_dropped", "port_xmit_wait")
 
 _FW_RE = re.compile(r"fw_ver:\s*(\S+)")
 _NUM_RE = re.compile(r"\d+(\.\d+)?")
