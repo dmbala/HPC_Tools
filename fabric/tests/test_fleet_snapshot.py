@@ -1,5 +1,10 @@
 """Tests for fabric/fleet_snapshot (aggregator core; CLI tested in Task 2)."""
 import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from fabric.tests import loader
@@ -113,6 +118,68 @@ class TestRenderFleetText(unittest.TestCase):
         text = fs.render_fleet_text(fs.aggregate(snaps))
         self.assertIn("fleet verdict: ANOMALIES", text)
         self.assertIn("symbol_error=3", text)
+
+
+TOOL_PATH = os.path.abspath(os.path.join(loader.HERE, "..", "fleet_snapshot"))
+
+
+def run_cli(*argv):
+    return subprocess.run([sys.executable, TOOL_PATH] + list(argv),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+
+
+class TestCliFromDir(unittest.TestCase):
+    def make_dir(self, doctor=None):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        for name in ("snapshot_nodea.json", "snapshot_nodeb.json"):
+            data = json.loads(loader.fixture(name))
+            if doctor:
+                doctor(data)
+            host = data["hostname"]
+            with open(os.path.join(tmp, host + ".json"), "w") as fh:
+                json.dump(data, fh)
+        return tmp
+
+    def test_clean_dir_exits_0(self):
+        proc = run_cli("--from-dir", self.make_dir())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("fleet verdict: CLEAN", proc.stdout)
+
+    def test_anomalous_dir_exits_1(self):
+        def doctor(data):
+            if data["hostname"] == "nodeb":
+                data["system"]["nvidia_driver"] = "550.54.15"
+        proc = run_cli("--from-dir", self.make_dir(doctor))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("fleet verdict: ANOMALIES", proc.stdout)
+
+    def test_json_output(self):
+        proc = run_cli("--from-dir", self.make_dir(), "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = json.loads(proc.stdout)
+        self.assertTrue(summary["clean"])
+
+    def test_corrupt_file_counts_unreached(self):
+        d = self.make_dir()
+        with open(os.path.join(d, "nodec.json"), "w") as fh:
+            fh.write("{not json")
+        proc = run_cli("--from-dir", d)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nodec", proc.stdout)
+
+    def test_empty_dir_exits_3(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        proc = run_cli("--from-dir", tmp)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
+
+    def test_missing_target_args_exits_3(self):
+        proc = run_cli()
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("error", proc.stderr.lower())
 
 
 if __name__ == "__main__":

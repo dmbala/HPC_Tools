@@ -18,6 +18,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fablib
+
 TOOL = "fleet_snapshot"
 
 # Error-class counters (same list counter_delta.sh watches).
@@ -156,5 +159,106 @@ def render_fleet_text(summary):
     return "\n".join(lines)
 
 
+def load_snapshot_dir(path):
+    """Read every *.json in a directory -> {host: dict|None (corrupt)}."""
+    snapshots = {}
+    for name in sorted(os.listdir(path)):
+        if not name.endswith(".json") or name == "summary.json":
+            continue
+        host = name[:-len(".json")]
+        try:
+            with open(os.path.join(path, name)) as fh:
+                snapshots[host] = json.load(fh)
+        except (OSError, ValueError):
+            snapshots[host] = None
+    return snapshots
+
+
+def _sbatch_script(repo_root, out_path):
+    return ("#!/bin/bash\n"
+            "%s/fabric/ib_snapshot.sh %s\n" % (repo_root, out_path))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="run ib_snapshot.sh across a nodelist via Slurm and "
+                    "aggregate the results (exit 0 clean, 1 anomalies, "
+                    "3 setup error)")
+    parser.add_argument("-p", "--partition")
+    parser.add_argument("-w", "--nodelist")
+    parser.add_argument("-A", "--account")
+    parser.add_argument("--gres", help="e.g. gpu:4 to include GPU sections")
+    parser.add_argument("--timeout", type=int, default=30,
+                        help="minutes to wait for all node jobs (default 30)")
+    parser.add_argument("--out", help="output dir (default "
+                        "results/snapshots/fleet_<runid>/)")
+    parser.add_argument("--json", action="store_true",
+                        help="print summary JSON instead of text")
+    parser.add_argument("--from-dir", metavar="DIR",
+                        help="skip Slurm; aggregate an existing snapshot dir")
+    args = parser.parse_args(argv)
+
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.realpath(__file__)))
+
+    try:
+        if args.from_dir:
+            snapshots = load_snapshot_dir(args.from_dir)
+            if not snapshots:
+                raise RuntimeError("no snapshot *.json files in %s"
+                                   % args.from_dir)
+            outdir = args.from_dir
+        else:
+            if not (args.partition or args.nodelist):
+                raise RuntimeError("need -p PARTITION or -w NODELIST "
+                                   "(or --from-dir)")
+            nodes = fablib.expand_nodes(nodelist=args.nodelist,
+                                        partition=args.partition)
+            import datetime
+            runid = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            outdir = args.out or os.path.join(
+                repo_root, "results", "snapshots", "fleet_" + runid)
+            os.makedirs(outdir, exist_ok=True)
+            job_to_host = {}
+            for node in nodes:
+                sbatch_args = ["-J", "fleet_snap_" + node, "-w", node,
+                               "-N", "1", "-c", "2", "--mem=4G", "-t", "5",
+                               "-o", os.path.join(outdir, node + ".log")]
+                if args.account:
+                    sbatch_args += ["-A", args.account]
+                if args.partition:
+                    sbatch_args += ["-p", args.partition]
+                if args.gres:
+                    sbatch_args += ["--gres", args.gres]
+                script = _sbatch_script(
+                    repo_root, os.path.join(outdir, node + ".json"))
+                job_to_host[fablib.submit_sbatch(script, sbatch_args)] = node
+            fablib.wait_for_jobs(set(job_to_host), args.timeout * 60)
+            snapshots = {}
+            for node in nodes:
+                path = os.path.join(outdir, node + ".json")
+                try:
+                    with open(path) as fh:
+                        snapshots[node] = json.load(fh)
+                except (OSError, ValueError):
+                    snapshots[node] = None
+    except RuntimeError as exc:
+        fablib.err_exit(TOOL, str(exc))
+
+    summary = aggregate(snapshots)
+    if not args.from_dir or os.access(outdir, os.W_OK):
+        try:
+            with open(os.path.join(outdir, "summary.json"), "w") as fh:
+                json.dump(summary, fh, indent=2)
+        except OSError:
+            pass  # summary still printed below
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(render_fleet_text(summary))
+    return 0 if summary["clean"] else 1
+
+
 if __name__ == "__main__":
-    sys.exit(0)  # main() arrives in Task 2
+    sys.exit(main())
