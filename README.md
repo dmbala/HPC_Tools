@@ -35,7 +35,7 @@ export PATH="$PWD/slurm:$PWD/gpu:$PWD/fabric:$PATH"
 
 | Dir | Run where | Needs |
 |---|---|---|
-| `slurm/` | any node with the Slurm client | `sacct` (and `scontrol` for `stotal_kempner`); Python 3 standard library only. **`seff_history`** additionally needs `numpy`, `pandas`, and `termplotlib` — its shebang points at the FASRC `seff-array` env (`/n/sw/envs/seff-array/bin/python3`); repoint it if that env isn't on your cluster. |
+| `slurm/` | any node with the Slurm client | `sacct` (plus `scontrol` for `stotal_kempner` and `frag_report`, `sshare` for `fairshare_report`, and `squeue` for `gpu_idle_now`); Python 3 standard library only. **`seff_history`** additionally needs `numpy`, `pandas`, and `termplotlib` — its shebang points at the FASRC `seff-array` env (`/n/sw/envs/seff-array/bin/python3`); repoint it if that env isn't on your cluster. **`gpu_idle_now`** additionally needs the jobstats `config` module + `requests` (it queries Prometheus like the `gpu/` window tools) and `gpu/gpulib.py` alongside in the repo. |
 | `gpu/` | wherever `jobstats` is installed | the jobstats `config` / `jobstats` Python modules (auto-discovered on `/usr/local/bin` or `/usr/bin`), the `requests` module (ships with jobstats), and a reachable Prometheus (`PROM_SERVER`, read from the jobstats `config`). **`gpu_health`** is the exception: it runs on the target GPU node and needs only `nvidia-smi` and the Python 3 standard library (no Prometheus, no jobstats modules). |
 | `fabric/` | on the target GPU node (no allocation needed) | host tools `nvidia-smi`, `ibstat`, `ibv_devinfo`, `ibdev2netdev`, plus `python3`. All probes are read-only. |
 | `analysis/` | anywhere with Python 3 | Python 3 standard library only — runs offline on a `history.jsonl` file. |
@@ -50,6 +50,11 @@ allocation or special privileges needed.
 | `jobstats_history` | Bulk per-job CPU%/MEM%/GPU%/GMEM% summary computed from each job's sacct AdminComment blob — one sacct query, no per-job `jobstats` calls, no job-count cap. See `README_jobstats_history.md`. |
 | `seff_history` | Job-efficiency report for a user/account over a window: state & resource summaries, simple-mean vs resource-weighted efficiency, a "most wasteful jobs" table, and efficiency-distribution histograms. See `README_seff_history.md`. |
 | `stotal_kempner` | Total CPU-hours / Mem-hours / GPU-hours / TRES-hours for a user, account, or partition over a window or last-N jobs — restricted to Kempner-owned nodes via `--nodelist`. |
+| `job_failures` | Window failure post-mortem: classifies terminal jobs (failed/OOM/timeout/cancelled/node-fail/preempted), ranks exit codes, failing job names/users, and incident nodes. |
+| `queue_wait` | Submit→Start wait distributions (p50/p90/max) by partition, QOS, and GPU-count bucket. Does not claim to split priority vs resource wait (sacct can't). |
+| `gpu_idle_now` | Live detector of running jobs whose GPUs are idle right now (SM activity below a threshold over a recent window). Exit 1 when a fully-idle job exists. |
+| `fairshare_report` | Point-in-time sshare snapshot: share vs effective usage per account, most over/under-served rankings. |
+| `frag_report` | Free CPU/GPU/memory shards per node and how many 1/2/4-GPU jobs could start right now, per partition. |
 
 ## gpu/ — GPU profiling metrics
 

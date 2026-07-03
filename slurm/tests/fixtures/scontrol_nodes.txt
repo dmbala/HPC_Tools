@@ -1,0 +1,4 @@
+NodeName=nodea CPUAlloc=8 CPUTot=64 State=MIXED Partitions=kempner_eng,kempner_requeue RealMemory=1547361 AllocMem=153600 CfgTRES=cpu=64,mem=1547361M,gres/gpu=4 AllocTRES=cpu=8,mem=150G,gres/gpu=1
+NodeName=nodeb CPUAlloc=64 CPUTot=64 State=ALLOCATED Partitions=kempner_eng RealMemory=1547361 AllocMem=1400000 CfgTRES=cpu=64,mem=1547361M,gres/gpu=4 AllocTRES=cpu=64,mem=1400000M,gres/gpu=4
+NodeName=nodec CPUAlloc=0 CPUTot=64 State=IDLE+DRAIN Partitions=kempner_eng RealMemory=1547361 AllocMem=0 CfgTRES=cpu=64,mem=1547361M,gres/gpu=4 AllocTRES=
+NodeName=noded CPUAlloc=0 CPUTot=64 State=IDLE Partitions=kempner_eng RealMemory=1547361 AllocMem=0 CfgTRES=cpu=64,mem=1547361M,gres/gpu=4 AllocTRES=

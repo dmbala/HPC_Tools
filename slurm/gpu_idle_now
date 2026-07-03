@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""gpu_idle_now -- running jobs whose GPUs are idle right now.
+
+Two Prometheus queries (via gpu/gpulib): which GPU belongs to which running
+job (nvidia_gpu_jobId > 0) and each GPU's SM activity averaged over a recent
+window. A job whose every matched GPU is below the threshold is FULLY IDLE
+-- the live gate behind gpu/fleet_util's retrospective numbers. GPUs with no
+SM data are counted as unmatched, never guessed.
+
+Runs wherever jobstats is installed (needs the jobstats config + requests).
+
+Usage:
+    gpu_idle_now [--threshold PCT] [--window MIN] [-p PARTITION] [--json]
+
+Exit codes: 0 no fully-idle jobs, 1 fully-idle jobs found, 3 error.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, _HERE)
+import slurmlib
+
+sys.path.insert(0, os.path.join(_HERE, "..", "gpu"))
+try:
+    import gpulib
+except ImportError:
+    slurmlib.err_exit("gpu_idle_now",
+                      "cannot import gpu/gpulib.py (expected in ../gpu "
+                      "relative to this tool)")
+
+TOOL = "gpu_idle_now"
+
+
+def group_jobs(alloc_result, smact_result, threshold_pct):
+    """Join allocation and SM-activity instant results per job."""
+    smact = {}
+    for series in smact_result:
+        uuid = gpulib.series_uuid(series.get("metric", {}))
+        try:
+            smact[uuid] = float(series["value"][1])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+    jobs = {}
+    for series in alloc_result:
+        labels = series.get("metric", {})
+        uuid = gpulib.series_uuid(labels)
+        try:
+            jobid = int(float(series["value"][1]))
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        if jobid <= 0:
+            continue
+        node = (labels.get("host") or labels.get("Hostname")
+                or "?").split(":")[0].split(".")[0]
+        job = jobs.setdefault(jobid, {"jobid": jobid, "gpus": 0, "idle": 0,
+                                      "unmatched": 0, "sm_values": [],
+                                      "nodes": set()})
+        job["gpus"] += 1
+        job["nodes"].add(node)
+        sm = smact.get(uuid)
+        if sm is None:
+            job["unmatched"] += 1
+        else:
+            job["sm_values"].append(sm * 100.0)
+            if sm * 100.0 < threshold_pct:
+                job["idle"] += 1
+    out = []
+    for job in jobs.values():
+        matched = job["gpus"] - job["unmatched"]
+        values = job.pop("sm_values")
+        job["mean_smact"] = (sum(values) / len(values)) if values else None
+        job["fully_idle"] = matched >= 1 and job["idle"] == matched
+        job["partially_idle"] = job["idle"] > 0 and not job["fully_idle"]
+        job["nodes"] = sorted(job["nodes"])
+        out.append(job)
+    out.sort(key=lambda j: (not j["fully_idle"], not j["partially_idle"],
+                            -j["idle"], j["jobid"]))
+    return out
+
+
+def attach_squeue(jobs, text):
+    """squeue '%A|%u|%a|%P|%L' rows -> user/account/partition/time_left."""
+    info = {}
+    for line in (text or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) >= 5 and parts[0].isdigit():
+            info[int(parts[0])] = {"user": parts[1], "account": parts[2],
+                                   "partition": parts[3],
+                                   "time_left": parts[4]}
+    for job in jobs:
+        job.update(info.get(job["jobid"], {}))
+    return jobs
+
+
+def render(jobs, threshold, window_min, partition):
+    flagged = [j for j in jobs if j["fully_idle"] or j["partially_idle"]]
+    fully = sum(1 for j in jobs if j["fully_idle"])
+    partial = sum(1 for j in jobs if j["partially_idle"])
+    lines = ["gpu_idle_now: %d running GPU job(s); %d fully idle, "
+             "%d partially idle (SM_ACT < %g%% averaged over %g min)"
+             % (len(jobs), fully, partial, threshold, window_min)]
+    if partition:
+        lines[0] += "  [partition filter: %s]" % partition
+    if flagged:
+        lines.append("")
+        row = "%-10s %-10s %-14s %-18s %5s %5s %5s %8s %10s"
+        lines.append(row % ("JOBID", "USER", "ACCOUNT", "PARTITION", "GPUS",
+                            "IDLE", "UNMAT", "SM_ACT%", "TIME_LEFT"))
+        for j in flagged:
+            lines.append(row % (
+                j["jobid"], j.get("user", "-"), j.get("account", "-"),
+                j.get("partition", "-"), j["gpus"], j["idle"],
+                j["unmatched"],
+                "%.1f" % j["mean_smact"] if j["mean_smact"] is not None
+                else "-",
+                j.get("time_left", "-")))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="running jobs whose GPUs are idle right now "
+                    "(exit 0 clean, 1 fully-idle jobs found, 3 error)")
+    parser.add_argument("--threshold", type=float, default=10.0,
+                        help="idle when SM_ACT%% below this (default 10)")
+    parser.add_argument("--window", type=float, default=30.0,
+                        help="averaging window in minutes (default 30)")
+    parser.add_argument("-p", "--partition",
+                        help="show only jobs in this partition")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-json", metavar="FILE",
+                        help="replay a captured query bundle (testing)")
+    args = parser.parse_args(argv)
+
+    if args.from_json:
+        bundle = gpulib.load_bundle(args.from_json, TOOL)
+        alloc = bundle.get("alloc", [])
+        smact = bundle.get("smact", [])
+        squeue_text = bundle.get("squeue", "")
+    else:
+        prom = gpulib.load_prom_server(TOOL)
+        try:
+            alloc = gpulib.query(prom, "nvidia_gpu_jobId > 0")
+            smact = gpulib.query(
+                prom, "avg_over_time(DCGM_FI_PROF_SM_ACTIVE[%ds:])"
+                % int(args.window * 60))
+        except RuntimeError as exc:
+            gpulib.err_exit(TOOL, str(exc))
+        squeue_text = ""
+
+    jobs = group_jobs(alloc, smact, args.threshold)
+    flagged_ids = [j["jobid"] for j in jobs
+                   if j["fully_idle"] or j["partially_idle"]]
+    if not args.from_json and flagged_ids:
+        try:
+            squeue_text = slurmlib.run(
+                ["squeue", "-j", ",".join(str(i) for i in flagged_ids),
+                 "-h", "-o", "%A|%u|%a|%P|%L"], timeout=60)
+        except RuntimeError as exc:
+            sys.stderr.write("warning: squeue enrichment unavailable: "
+                             "%s\n" % exc)
+    attach_squeue(jobs, squeue_text)
+
+    if args.partition:
+        kept = [j for j in jobs
+                if j.get("partition") in (args.partition, None)]
+        dropped = len(jobs) - len(kept)
+        if dropped:
+            sys.stderr.write("note: %d job(s) in other partitions hidden\n"
+                             % dropped)
+        jobs = kept
+
+    if args.json:
+        print(json.dumps({"threshold_pct": args.threshold,
+                          "window_min": args.window, "jobs": jobs},
+                         indent=2))
+    else:
+        print(render(jobs, args.threshold, args.window, args.partition))
+    return 1 if any(j["fully_idle"] for j in jobs) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

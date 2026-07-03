@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""queue_wait -- Submit->Start wait distributions from sacct.
+
+Reports wait-time distributions (count, p50, p90, max; nearest-rank) grouped
+by partition, QOS, and GPU-count bucket. Honesty note: sacct carries no
+pending-reason history, so this does NOT separate priority wait from
+resource wait.
+
+Usage:
+    queue_wait (-p PARTITION | -A ACCOUNT | -u USER)
+               [--days N | --since ISO --until ISO] [--json]
+
+Exit codes: 0 report, 3 error.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurmlib
+
+TOOL = "queue_wait"
+SACCT_FIELDS = "JobIDRaw,Partition,QOS,Submit,Start,State,AllocTRES"
+_KEYS = ("jobid", "partition", "qos", "submit", "start", "state",
+         "alloc_tres")
+
+
+def parse_queue_rows(text):
+    rows, malformed = [], 0
+    for line in (text or "").splitlines():
+        parts = line.split("|")
+        if len(parts) < len(_KEYS) or not parts[0].strip().isdigit():
+            if line.strip():
+                malformed += 1
+            continue
+        row = dict(zip(_KEYS, parts))
+        row["jobid"] = int(row["jobid"])
+        row["gpus"] = slurmlib.gpus_from_tres(row.pop("alloc_tres"))
+        rows.append(row)
+    return rows, malformed
+
+
+def bucket_for(gpus):
+    if gpus <= 0:
+        return "0"
+    if gpus == 1:
+        return "1"
+    if gpus <= 4:
+        return "2-4"
+    return ">4"
+
+
+def waits(rows):
+    """-> (started list, excluded counts). Pending rows (no Start) and
+    Start < Submit skew rows are excluded and counted."""
+    started, excluded = [], {"pending": 0, "skew": 0}
+    for row in rows:
+        if row["start"] in ("", "Unknown", "None", "NONE"):
+            excluded["pending"] += 1
+            continue
+        try:
+            wait_s = (slurmlib.iso_epoch(row["start"])
+                      - slurmlib.iso_epoch(row["submit"]))
+        except ValueError:
+            excluded["pending"] += 1
+            continue
+        if wait_s < 0:
+            excluded["skew"] += 1
+            continue
+        started.append({"wait_s": wait_s, "partition": row["partition"],
+                        "qos": row["qos"],
+                        "bucket": bucket_for(row["gpus"])})
+    return started, excluded
+
+
+def distribution(values):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return {"n": len(ordered), "p50": slurmlib.pctile(ordered, 50),
+            "p90": slurmlib.pctile(ordered, 90), "max": ordered[-1]}
+
+
+def group(started, key):
+    buckets = {}
+    for item in started:
+        buckets.setdefault(item[key], []).append(item["wait_s"])
+    return dict((name, distribution(vals)) for name, vals in buckets.items())
+
+
+def render(started, excluded, malformed, start, end):
+    lines = ["queue_wait: %s -> %s"
+             % (slurmlib.epoch_iso(start), slurmlib.epoch_iso(end)), ""]
+    lines.append("  %d started jobs; excluded: %d pending, %d clock-skew; "
+                 "%d malformed rows"
+                 % (len(started), excluded["pending"], excluded["skew"],
+                    malformed))
+    lines.append("  (sacct cannot separate priority wait from resource wait)")
+
+    def table(title, key):
+        grouped = group(started, key)
+        if not grouped:
+            return
+        lines.append("")
+        lines.append("by %s:" % title)
+        lines.append("  %-24s %6s %10s %10s %10s"
+                     % ("GROUP", "N", "P50", "P90", "MAX"))
+        for name in sorted(grouped):
+            d = grouped[name]
+            lines.append("  %-24s %6d %10s %10s %10s"
+                         % (name, d["n"], slurmlib.humanize(d["p50"]),
+                            slurmlib.humanize(d["p90"]),
+                            slurmlib.humanize(d["max"])))
+
+    table("partition", "partition")
+    table("QOS", "qos")
+    table("GPU count", "bucket")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Submit->Start wait distributions from sacct "
+                    "(exit 0 report, 3 error)")
+    slurmlib.add_window_args(parser)
+    parser.add_argument("-u", "--user")
+    parser.add_argument("-A", "--account")
+    parser.add_argument("-p", "--partition")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-file", metavar="SACCT_TXT",
+                        help="replay captured sacct -P output (testing)")
+    args = parser.parse_args(argv)
+    selectors = [s for s in (args.user, args.account, args.partition) if s]
+    if len(selectors) > 1:
+        slurmlib.err_exit(TOOL, "use only one of -u / -A / -p")
+    start, end = slurmlib.parse_window(args, TOOL)
+
+    if args.from_file:
+        text = slurmlib.read_text(args.from_file, TOOL)
+    else:
+        cmd = ["sacct", "-X", "-n", "-P", "-o", SACCT_FIELDS,
+               "-S", slurmlib.epoch_iso(start), "-E", slurmlib.epoch_iso(end)]
+        if args.account:
+            cmd += ["-A", args.account, "-a"]
+        elif args.partition:
+            cmd += ["-r", args.partition, "-a"]
+        else:
+            cmd += ["-u", args.user or getpass.getuser()]
+        try:
+            text = slurmlib.run(cmd, timeout=120)
+        except RuntimeError as exc:
+            slurmlib.err_exit(TOOL, str(exc))
+
+    rows, malformed = parse_queue_rows(text)
+    started, excluded = waits(rows)
+    if args.json:
+        print(json.dumps({"start": start, "end": end,
+                          "excluded": excluded, "malformed": malformed,
+                          "by_partition": group(started, "partition"),
+                          "by_qos": group(started, "qos"),
+                          "by_gpu_bucket": group(started, "bucket")},
+                         indent=2))
+    else:
+        print(render(started, excluded, malformed, start, end))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

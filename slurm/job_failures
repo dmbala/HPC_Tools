@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""job_failures -- window failure post-mortem from sacct.
+
+Classifies every terminal job in a window (per user, account, or partition)
+into completed / failed / oom / timeout / cancelled / node_fail / preempted,
+and ranks exit codes, failing job names, failing users, and incident nodes.
+
+Usage:
+    job_failures [-u USER | -A ACCOUNT | -p PARTITION]
+                 [--days N | --since ISO --until ISO] [--top N] [--json]
+
+Exit codes: 0 report, 3 error.
+"""
+
+import argparse
+import collections
+import getpass
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurmlib
+
+TOOL = "job_failures"
+SACCT_FIELDS = ("JobIDRaw,User,Account,Partition,State,ExitCode,"
+                "DerivedExitCode,Elapsed,Timelimit,ReqMem,AllocTRES,"
+                "NodeList,JobName")
+FAILURE_CLASSES = ("failed", "oom", "timeout", "node_fail", "cancelled",
+                   "preempted")
+_KEYS = ("jobid", "user", "account", "partition", "state", "exit_code",
+         "derived_exit", "elapsed", "timelimit", "req_mem", "alloc_tres",
+         "nodelist", "job_name")
+
+
+def classify_state(state):
+    """Spec precedence; first match wins."""
+    s = (state or "").upper()
+    if s.startswith("OUT_OF_MEMORY"):
+        return "oom"
+    if s.startswith("TIMEOUT"):
+        return "timeout"
+    if s.startswith("NODE_FAIL"):
+        return "node_fail"
+    if s.startswith("PREEMPTED"):
+        return "preempted"
+    if s.startswith("CANCELLED"):
+        return "cancelled"
+    if s.startswith("FAILED"):
+        return "failed"
+    if s.startswith("COMPLETED"):
+        return "completed"
+    if s.startswith(("RUNNING", "PENDING", "REQUEUED", "SUSPENDED")):
+        return "active"
+    return "other"
+
+
+def parse_rows(text):
+    """sacct -P rows -> (job dicts, malformed count)."""
+    jobs, malformed = [], 0
+    for line in (text or "").splitlines():
+        parts = line.split("|")
+        if len(parts) < len(_KEYS) or not parts[0].strip().isdigit():
+            if line.strip():
+                malformed += 1
+            continue
+        job = dict(zip(_KEYS, parts))
+        job["jobid"] = int(job["jobid"])
+        job["cls"] = classify_state(job["state"])
+        jobs.append(job)
+    return jobs, malformed
+
+
+def summarize(jobs, top_n):
+    counts = collections.Counter(j["cls"] for j in jobs)
+    terminal = len(jobs) - counts.get("active", 0)
+    noncompleted = terminal - counts.get("completed", 0)
+    rate = (100.0 * noncompleted / terminal) if terminal else 0.0
+    exit_codes = collections.Counter(
+        j["exit_code"] for j in jobs if j["cls"] == "failed")
+    fail_jobs = [j for j in jobs if j["cls"] in FAILURE_CLASSES]
+    names = collections.Counter(j["job_name"] for j in fail_jobs)
+    users = collections.Counter(j["user"] for j in fail_jobs)
+    nodes = collections.Counter(
+        j["nodelist"] for j in jobs if j["cls"] in ("node_fail", "oom"))
+    return {"counts": dict(counts), "terminal": terminal,
+            "failure_rate_pct": rate,
+            "top_exit_codes": exit_codes.most_common(top_n),
+            "top_failing_names": names.most_common(top_n),
+            "top_failing_users": users.most_common(top_n),
+            "incident_nodes": nodes.most_common(top_n)}
+
+
+def render(summary, malformed, start, end):
+    lines = ["job_failures: %s -> %s"
+             % (slurmlib.epoch_iso(start), slurmlib.epoch_iso(end)), ""]
+    counts = summary["counts"]
+    lines.append("  jobs: %d terminal, %d active, %d malformed rows skipped"
+                 % (summary["terminal"], counts.get("active", 0), malformed))
+    lines.append("  by class: " + "  ".join(
+        "%s=%d" % (c, counts[c]) for c in sorted(counts) if c != "active"))
+    lines.append("  failure rate: %.1f%% of terminal jobs"
+                 % summary["failure_rate_pct"])
+
+    def table(title, pairs, label):
+        if not pairs:
+            return
+        lines.append("")
+        lines.append("%s:" % title)
+        for value, count in pairs:
+            lines.append("  %-40s %6d %s" % (value, count, label))
+
+    table("top exit codes (FAILED jobs)", summary["top_exit_codes"], "jobs")
+    table("top failing job names", summary["top_failing_names"], "jobs")
+    table("top failing users", summary["top_failing_users"], "jobs")
+    table("nodes with OOM / NODE_FAIL incidents", summary["incident_nodes"],
+          "incidents")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="window failure post-mortem from sacct "
+                    "(exit 0 report, 3 error)")
+    slurmlib.add_window_args(parser)
+    parser.add_argument("-u", "--user")
+    parser.add_argument("-A", "--account")
+    parser.add_argument("-p", "--partition")
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-file", metavar="SACCT_TXT",
+                        help="replay captured sacct -P output (testing)")
+    args = parser.parse_args(argv)
+    selectors = [s for s in (args.user, args.account, args.partition) if s]
+    if len(selectors) > 1:
+        slurmlib.err_exit(TOOL, "use only one of -u / -A / -p")
+    start, end = slurmlib.parse_window(args, TOOL)
+
+    if args.from_file:
+        text = slurmlib.read_text(args.from_file, TOOL)
+    else:
+        cmd = ["sacct", "-X", "-n", "-P", "-o", SACCT_FIELDS,
+               "-S", slurmlib.epoch_iso(start), "-E", slurmlib.epoch_iso(end)]
+        if args.account:
+            cmd += ["-A", args.account, "-a"]
+        elif args.partition:
+            cmd += ["-r", args.partition, "-a"]
+        else:
+            cmd += ["-u", args.user or getpass.getuser()]
+        try:
+            text = slurmlib.run(cmd, timeout=120)
+        except RuntimeError as exc:
+            slurmlib.err_exit(TOOL, str(exc))
+
+    jobs, malformed = parse_rows(text)
+    summary = summarize(jobs, args.top)
+    if args.json:
+        print(json.dumps({"start": start, "end": end, "malformed": malformed,
+                          "summary": summary}, indent=2))
+    else:
+        print(render(summary, malformed, start, end))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

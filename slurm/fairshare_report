@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""fairshare_report -- share vs effective usage per account, from sshare.
+
+Point-in-time snapshot (sshare keeps no history): for every top-level
+account, compares NormShares against EffectvUsage (ratio > 1 = over-served)
+and ranks the most over- and under-served accounts. --json output makes
+periodic archiving trivial if trending is wanted later.
+
+Usage:
+    fairshare_report [-A ACCOUNT] [--top N] [--json]
+
+Exit codes: 0 report, 3 error.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurmlib
+
+TOOL = "fairshare_report"
+SSHARE_FIELDS = ("Account,User,RawShares,NormShares,RawUsage,"
+                 "EffectvUsage,FairShare")
+
+
+def _to_float(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_sshare(text):
+    """sshare -a -P rows -> (top-level account dicts, skipped counts)."""
+    accounts = []
+    skipped = {"root": 0, "user_rows": 0, "malformed": 0}
+    for line in (text or "").splitlines():
+        parts = line.split("|")
+        if len(parts) < 7:
+            if line.strip():
+                skipped["malformed"] += 1
+            continue
+        account, user = parts[0].strip(), parts[1].strip()
+        if account == "Account":  # header
+            continue
+        if account == "root":
+            skipped["root"] += 1
+            continue
+        if user:
+            skipped["user_rows"] += 1
+            continue
+        accounts.append({"account": account,
+                         "raw_shares": _to_float(parts[2]),
+                         "norm_shares": _to_float(parts[3]),
+                         "raw_usage": _to_float(parts[4]),
+                         "effectv_usage": _to_float(parts[5]),
+                         "fairshare": _to_float(parts[6])})
+    return accounts, skipped
+
+
+def rank(accounts, top_n):
+    usable = [a for a in accounts
+              if a["norm_shares"] and a["norm_shares"] > 0]
+    no_shares = len(accounts) - len(usable)
+    with_usage = []
+    zero = 0
+    for a in usable:
+        usage = a["effectv_usage"]
+        if usage is None or usage <= 0:
+            a["ratio"] = 0.0
+            zero += 1
+        else:
+            a["ratio"] = usage / a["norm_shares"]
+            with_usage.append(a)
+    return {"usable": len(usable), "zero_usage": zero, "no_shares": no_shares,
+            "over": sorted(with_usage, key=lambda a: a["ratio"],
+                           reverse=True)[:top_n],
+            "under": sorted(with_usage, key=lambda a: a["ratio"])[:top_n]}
+
+
+def _table(lines, title, rows):
+    if not rows:
+        return
+    lines.append("")
+    lines.append("%s:" % title)
+    lines.append("  %-24s %12s %14s %10s %10s"
+                 % ("ACCOUNT", "NORM_SHARES", "EFFECTV_USAGE", "RATIO",
+                    "FAIRSHARE"))
+    for a in rows:
+        lines.append("  %-24s %12.6f %14.6f %10.2f %10s"
+                     % (a["account"], a["norm_shares"], a["effectv_usage"],
+                        a["ratio"],
+                        "%.4f" % a["fairshare"]
+                        if a["fairshare"] is not None else "-"))
+
+
+def render(accounts, skipped, ranked):
+    lines = ["fairshare_report: %d top-level accounts (%d with zero usage; "
+             "%d without shares; skipped %d user rows, %d malformed)"
+             % (ranked["usable"], ranked["zero_usage"], ranked["no_shares"],
+                skipped["user_rows"], skipped["malformed"])]
+    _table(lines, "most over-served (usage >> share)", ranked["over"])
+    _table(lines, "most under-served (usage << share)", ranked["under"])
+    lines.append("")
+    lines.append("note: point-in-time snapshot; sshare keeps no history")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="share vs effective usage per account from sshare "
+                    "(exit 0 report, 3 error)")
+    parser.add_argument("-A", "--account",
+                        help="narrow to one account subtree")
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-file", metavar="SSHARE_TXT",
+                        help="replay captured sshare -P output (testing)")
+    args = parser.parse_args(argv)
+
+    if args.from_file:
+        text = slurmlib.read_text(args.from_file, TOOL)
+    else:
+        cmd = ["sshare", "-a", "-P", "-o", SSHARE_FIELDS]
+        if args.account:
+            cmd += ["-A", args.account]
+        try:
+            text = slurmlib.run(cmd, timeout=120)
+        except RuntimeError as exc:
+            slurmlib.err_exit(TOOL, str(exc))
+
+    accounts, skipped = parse_sshare(text)
+    ranked = rank(accounts, args.top)
+    if args.json:
+        print(json.dumps({"skipped": skipped, "ranked": ranked}, indent=2))
+    else:
+        print(render(accounts, skipped, ranked))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
