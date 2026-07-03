@@ -9,6 +9,7 @@ HPC_Tools/
 ├── slurm/      # Slurm job accounting & utilization reporting (sacct-based)
 ├── gpu/        # GPU profiling metrics (DCGM via Prometheus)
 ├── fabric/     # InfiniBand topology & error-counter diagnostics (read-only)
+├── io/         # filesystem responsiveness probes (read/write/metadata)
 └── analysis/   # post-processing: history.jsonl → reports / verdicts / trends
 ```
 
@@ -38,6 +39,7 @@ export PATH="$PWD/slurm:$PWD/gpu:$PWD/fabric:$PATH"
 | `slurm/` | any node with the Slurm client | `sacct` (plus `scontrol` for `stotal_kempner` and `frag_report`, `sshare` for `fairshare_report`, and `squeue` for `gpu_idle_now`); Python 3 standard library only. **`seff_history`** additionally needs `numpy`, `pandas`, and `termplotlib` — its shebang points at the FASRC `seff-array` env (`/n/sw/envs/seff-array/bin/python3`); repoint it if that env isn't on your cluster. **`gpu_idle_now`** additionally needs the jobstats `config` module + `requests` (it queries Prometheus like the `gpu/` window tools) and `gpu/gpulib.py` alongside in the repo. |
 | `gpu/` | wherever `jobstats` is installed | the jobstats `config` / `jobstats` Python modules (auto-discovered on `/usr/local/bin` or `/usr/bin`), the `requests` module (ships with jobstats), and a reachable Prometheus (`PROM_SERVER`, read from the jobstats `config`). **`gpu_health`** is the exception: it runs on the target GPU node and needs only `nvidia-smi` and the Python 3 standard library (no Prometheus, no jobstats modules). |
 | `fabric/` | on the target GPU node (no allocation needed) | host tools `nvidia-smi`, `ibstat`, `ibv_devinfo`, `ibdev2netdev`, plus `python3`. All probes are read-only. The Slurm-based tools (`fleet_snapshot`, `nccl_check`, `ib_bw_pair`) additionally need the Slurm client and a valid account/partition; `ib_bw_pair` needs the `perftest` package on the nodes; `nccl_check` needs an `nccl-tests` build. `topo_verify`/`fleet_snapshot --from-dir` also run offline on saved snapshots. |
+| `io/` | any node | Python 3 standard library only. |
 | `analysis/` | anywhere with Python 3 | Python 3 standard library only — runs offline on a `history.jsonl` file. |
 
 ## slurm/ — job accounting & utilization
@@ -55,6 +57,7 @@ allocation or special privileges needed.
 | `gpu_idle_now` | Live detector of running jobs whose GPUs are idle right now (SM activity below a threshold over a recent window). Exit 1 when a fully-idle job exists. |
 | `fairshare_report` | Point-in-time sshare snapshot: share vs effective usage per account, most over/under-served rankings. |
 | `frag_report` | Free CPU/GPU/memory shards per node and how many 1/2/4-GPU jobs could start right now, per partition. |
+| `slurm_selftest` | Canary job verifying the scheduler itself: env-var propagation, GPU grant, GRES accounting, cgroup OOM enforcement, node placement. Exit 1 on any failed check. Adapted from fasrc/reframe-fasrc. |
 
 ## gpu/ — GPU profiling metrics
 
@@ -105,6 +108,15 @@ fabric/ib_snapshot.sh results/snapshots/before.json
 fabric/ib_snapshot.sh results/snapshots/after.json
 fabric/counter_delta.sh results/snapshots/before.json results/snapshots/after.json
 ```
+
+## io/ — filesystem probes
+
+Quick responsiveness probes (seconds, not benchmarks). Run where invoked —
+wrap in `srun` to probe from a compute node.
+
+| Tool | What it does |
+|---|---|
+| `io_probe` | Bounded sequential write/read MB/s (fsync'd; read is page-cache-assisted and labeled as such) plus small-file create/stat/delete latency against `--dir`. Optional `--min-*` gates; report-only by default. Adapted from fasrc/reframe-fasrc's IOR check, reduced to a probe. |
 
 ## analysis/ — history post-processing
 
