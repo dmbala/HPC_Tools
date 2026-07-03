@@ -84,14 +84,14 @@ def parse_counter_lines(text):
 
 
 def _job_script(binary, gpn, counters, repo_root, outdir):
+    snapdir = "%s/counters" % outdir
     lines = ["#!/bin/bash", "set -u"]
     if counters:
         lines += [
-            "SNAPDIR=%s/counters" % outdir,
-            "mkdir -p $SNAPDIR",
+            "mkdir -p %s" % snapdir,
             "srun --ntasks-per-node=1 bash -c "
-            "'%s/fabric/ib_snapshot.sh $SNAPDIR/before_$(hostname -s).json'"
-            % repo_root,
+            "'%s/fabric/ib_snapshot.sh %s/before_$(hostname -s).json'"
+            % (repo_root, snapdir),
         ]
     lines.append("srun --ntasks-per-node=%d --gpus-per-node=%d "
                  "%s -b 8 -e 1G -f 2 -g 1" % (gpn, gpn, binary))
@@ -99,12 +99,12 @@ def _job_script(binary, gpn, counters, repo_root, outdir):
     if counters:
         lines += [
             "srun --ntasks-per-node=1 bash -c "
-            "'%s/fabric/ib_snapshot.sh $SNAPDIR/after_$(hostname -s).json'"
-            % repo_root,
-            "for b in $SNAPDIR/before_*.json; do",
+            "'%s/fabric/ib_snapshot.sh %s/after_$(hostname -s).json'"
+            % (repo_root, snapdir),
+            "for b in %s/before_*.json; do" % snapdir,
             "  h=$(basename $b); h=${h#before_}; h=${h%.json}",
-            "  %s/fabric/counter_delta.sh $b $SNAPDIR/after_$h.json "
-            ">/dev/null 2>&1" % repo_root,
+            "  %s/fabric/counter_delta.sh $b %s/after_$h.json "
+            ">/dev/null 2>&1" % (repo_root, snapdir),
             "  echo \"COUNTER_DELTA $h rc=$?\"",
             "done",
         ]
@@ -144,6 +144,7 @@ def main(argv=None):
 
     sbatch_args = ["-J", TOOL, "-A", args.account, "-p", args.partition,
                    "-N", str(args.nodes), "--gpus-per-node=%d" % args.gpn,
+                   "--ntasks-per-node=%d" % args.gpn,
                    "-c", "8", "--mem=32G", "-t", str(args.timeout),
                    "-o", outfile]
     if args.nodelist:

@@ -142,6 +142,16 @@ class TestCli(unittest.TestCase):
         self.assertEqual(findings["hardware"], [])
         self.assertEqual(len(findings["informational"]), 1)
 
+    def test_save_golden_bare_filename(self):
+        c = self.path_for(snap(), "current.json")
+        proc = subprocess.run([sys.executable, TOOL_PATH, "--save-golden",
+                               "--current", c, "--golden", "bare_golden.json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp,
+                                                    "bare_golden.json")))
+
 
 if __name__ == "__main__":
     unittest.main()

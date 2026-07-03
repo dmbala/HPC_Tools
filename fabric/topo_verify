@@ -125,13 +125,17 @@ def _take_snapshot():
                           "ib_snapshot.sh")
     tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
     tmp.close()
-    r = fablib.run([script, tmp.name], timeout=120)
-    if r.returncode != 0:
-        raise RuntimeError("ib_snapshot.sh failed: %s" % r.stderr.strip())
-    with open(tmp.name) as fh:
-        snap = json.load(fh)
-    os.unlink(tmp.name)
-    return snap
+    try:
+        r = fablib.run([script, tmp.name], timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError("ib_snapshot.sh failed: %s" % r.stderr.strip())
+        with open(tmp.name) as fh:
+            return json.load(fh)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 def render_text(findings, strict):
@@ -183,7 +187,9 @@ def main(argv=None):
 
     if args.save_golden:
         try:
-            os.makedirs(os.path.dirname(golden_path), exist_ok=True)
+            golden_dir = os.path.dirname(golden_path)
+            if golden_dir:
+                os.makedirs(golden_dir, exist_ok=True)
             with open(golden_path, "w") as fh:
                 json.dump(current, fh, indent=2)
         except OSError as exc:

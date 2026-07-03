@@ -105,6 +105,12 @@ class TestAggregate(unittest.TestCase):
         self.assertFalse(summary["clean"])
         self.assertTrue(any("nodeb" in u for u in summary["unavailable"]), summary)
 
+    def test_port_xmit_wait_not_gated(self):
+        snaps = clean_pair()
+        snaps["nodea"]["ib"]["hcas"][0]["ports"][0]["counters"]["port_xmit_wait"] = 999999
+        summary = fs.aggregate(snaps)
+        self.assertTrue(summary["clean"])
+
 
 class TestRenderFleetText(unittest.TestCase):
     def test_clean_report(self):
@@ -184,7 +190,7 @@ class TestCliFromDir(unittest.TestCase):
     def test_nonexistent_from_dir_exits_3(self):
         proc = run_cli("--from-dir", "/nonexistent-fleet-dir")
         self.assertEqual(proc.returncode, 3)
-        self.assertIn("error", proc.stderr.lower())
+        self.assertIn("fleet_snapshot: error:", proc.stderr)
 
 
 if __name__ == "__main__":

@@ -73,5 +73,26 @@ class TestCounterLines(unittest.TestCase):
         self.assertEqual(nc.parse_counter_lines("no markers here"), [])
 
 
+class TestJobScript(unittest.TestCase):
+    def test_counters_script_interpolates_literal_paths(self):
+        script = nc._job_script("/x/all_reduce_perf", 4, True,
+                                "/repo", "/repo/results/run1")
+        self.assertIn("/repo/results/run1/counters/before_$(hostname -s).json",
+                      script)
+        self.assertIn("/repo/results/run1/counters/after_$(hostname -s).json",
+                      script)
+        self.assertIn("for b in /repo/results/run1/counters/before_*.json",
+                      script)
+        self.assertNotIn("$SNAPDIR", script)
+        self.assertNotIn("%s", script)
+        self.assertIn("h=${h%.json}", script)
+
+    def test_no_counters_script_minimal(self):
+        script = nc._job_script("/x/all_reduce_perf", 4, False, "/repo", "/o")
+        self.assertNotIn("ib_snapshot", script)
+        self.assertIn("--ntasks-per-node=4 --gpus-per-node=4", script)
+        self.assertNotIn("%s", script)
+
+
 if __name__ == "__main__":
     unittest.main()
