@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""frag_report -- free CPU/GPU/memory shards per node, and how many N-GPU
+jobs could start right now, per partition.
+
+Reads one `scontrol show node -o` pass. Nodes in DOWN/DRAIN/MAINT/
+NOT_RESPONDING states are excluded from capacity math and listed. The
+schedulability counts use a configurable job shape (default 8 CPUs and
+64 GiB per GPU).
+
+Usage:
+    frag_report [-p PARTITION] [--cpus-per-gpu N] [--mem-per-gpu GIB]
+                [--json]
+
+Exit codes: 0 report, 3 error.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurmlib
+
+TOOL = "frag_report"
+BAD_STATES = ("DOWN", "DRAIN", "MAINT", "NOT_RESPONDING")
+SHAPES = (1, 2, 4)
+
+
+def parse_kv(line):
+    """Space-split key=value tokens -> dict (values keep their commas)."""
+    kv = {}
+    for token in line.split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            kv[key] = value
+    return kv
+
+
+def _to_int(text):
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_nodes(text):
+    """-> (usable node dicts, unavailable [{name,state}], malformed)."""
+    nodes, unavailable, malformed = [], [], 0
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        kv = parse_kv(line)
+        name = kv.get("NodeName")
+        if not name:
+            malformed += 1
+            continue
+        state = kv.get("State", "")
+        if any(bad in state.upper() for bad in BAD_STATES):
+            unavailable.append({"name": name, "state": state})
+            continue
+        gpu_tot = slurmlib.gpus_from_tres(kv.get("CfgTRES", ""))
+        gpu_alloc = slurmlib.gpus_from_tres(kv.get("AllocTRES", ""))
+        nodes.append({
+            "name": name,
+            "partitions": [p for p in kv.get("Partitions", "").split(",")
+                           if p],
+            "state": state,
+            "cpu_free": _to_int(kv.get("CPUTot")) - _to_int(kv.get("CPUAlloc")),
+            "mem_free_mib": _to_int(kv.get("RealMemory"))
+                            - _to_int(kv.get("AllocMem")),
+            "gpu_tot": gpu_tot,
+            "gpu_free": max(0, gpu_tot - gpu_alloc),
+        })
+    return nodes, unavailable, malformed
+
+
+def fragmentation(nodes, cpus_per_gpu, mem_per_gpu_gib):
+    """Per-partition free-GPU distribution and N-GPU-job fit counts."""
+    mem_per_gpu_mib = mem_per_gpu_gib * 1024
+    per_part = {}
+    for node in nodes:
+        for part in (node["partitions"] or ["(none)"]):
+            stats = per_part.setdefault(
+                part, {"nodes": 0,
+                       "gpu_dist": {0: 0, 1: 0, 2: 0, 3: 0, "4+": 0},
+                       "fit": {1: 0, 2: 0, 4: 0}})
+            stats["nodes"] += 1
+            free = node["gpu_free"]
+            stats["gpu_dist"][free if free < 4 else "4+"] += 1
+            for shape in SHAPES:
+                fits = min(free // shape,
+                           node["cpu_free"] // (shape * cpus_per_gpu),
+                           node["mem_free_mib"]
+                           // (shape * mem_per_gpu_mib))
+                stats["fit"][shape] += max(0, fits)
+    return per_part
+
+
+def render(per_part, unavailable, malformed, cpus_per_gpu, mem_per_gpu_gib):
+    lines = ["frag_report: job shape = %d CPUs + %d GiB per GPU"
+             % (cpus_per_gpu, mem_per_gpu_gib), ""]
+    lines.append("%-24s %6s %-22s %7s %7s %7s"
+                 % ("PARTITION", "NODES", "FREE_GPUS(0/1/2/3/4+)",
+                    "FIT_1G", "FIT_2G", "FIT_4G"))
+    for part in sorted(per_part):
+        s = per_part[part]
+        dist = "/".join(str(s["gpu_dist"][k]) for k in (0, 1, 2, 3, "4+"))
+        lines.append("%-24s %6d %-22s %7d %7d %7d"
+                     % (part, s["nodes"], dist,
+                        s["fit"][1], s["fit"][2], s["fit"][4]))
+    lines.append("")
+    lines.append("%d node(s) unavailable (down/drain/maint), excluded; "
+                 "%d malformed lines" % (len(unavailable), malformed))
+    for u in unavailable[:10]:
+        lines.append("  %s (%s)" % (u["name"], u["state"]))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="free-shard fragmentation and N-GPU-job fit counts "
+                    "per partition (exit 0 report, 3 error)")
+    parser.add_argument("-p", "--partition",
+                        help="restrict to nodes in this partition")
+    parser.add_argument("--cpus-per-gpu", type=int, default=8,
+                        dest="cpus_per_gpu")
+    parser.add_argument("--mem-per-gpu", type=int, default=64,
+                        dest="mem_per_gpu", metavar="GIB")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-file", metavar="SCONTROL_TXT",
+                        help="replay captured scontrol show node -o output")
+    args = parser.parse_args(argv)
+
+    if args.from_file:
+        text = slurmlib.read_text(args.from_file, TOOL)
+    else:
+        try:
+            text = slurmlib.run(["scontrol", "show", "node", "-o"],
+                                timeout=60)
+        except RuntimeError as exc:
+            slurmlib.err_exit(TOOL, str(exc))
+
+    nodes, unavailable, malformed = parse_nodes(text)
+    if args.partition:
+        nodes = [n for n in nodes if args.partition in n["partitions"]]
+        unavailable = [u for u in unavailable]  # kept; shown regardless
+    per_part = fragmentation(nodes, args.cpus_per_gpu, args.mem_per_gpu)
+    if args.partition:
+        per_part = dict((k, v) for k, v in per_part.items()
+                        if k == args.partition)
+    if args.json:
+        payload = {"partitions": dict(
+            (part, {"nodes": s["nodes"],
+                    "gpu_dist": dict((str(k), v)
+                                     for k, v in s["gpu_dist"].items()),
+                    "fit": dict((str(k), v) for k, v in s["fit"].items())})
+            for part, s in per_part.items()),
+            "unavailable": unavailable, "malformed": malformed}
+        print(json.dumps(payload, indent=2))
+    else:
+        print(render(per_part, unavailable, malformed, args.cpus_per_gpu,
+                     args.mem_per_gpu))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
