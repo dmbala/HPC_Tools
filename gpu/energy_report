@@ -104,6 +104,19 @@ def energy_kwh(delta_result, uuids):
     return (total_mj / MJ_PER_KWH) if matched else None
 
 
+def uuid_regex(uuids):
+    """Validated alternation for a PromQL UUID=~ selector.
+
+    UUIDs are hex + hyphen, which is RE2-safe as a literal; anything else is
+    dropped (returned separately) rather than escaped, because Python
+    re.escape output (e.g. GPU\\-...) is not valid inside a PromQL string.
+    Returns (regex_or_None, safe_uuids, dropped_count).
+    """
+    safe = [u for u in uuids if u and re.match(r"^[A-Za-z0-9-]+$", u)]
+    dropped = len(uuids) - len(safe)
+    return ("|".join(safe) if safe else None), safe, dropped
+
+
 def rollup(job_rows, top_n):
     counted = [j for j in job_rows if j.get("kwh") is not None]
     total_kwh = sum(j["kwh"] for j in counted)
@@ -237,7 +250,14 @@ def main(argv=None):
         if args.from_json:
             eres = energy.get(jid, [])
         else:
-            rx = "|".join(re.escape(u) for u in uuids)
+            rx, safe_uuids, dropped = uuid_regex(uuids)
+            if dropped:
+                sys.stderr.write("warning: job %s: skipped %d uuid(s) with "
+                                 "unexpected characters\n" % (jid, dropped))
+            if rx is None:
+                job["kwh"] = None
+                continue
+            uuids = safe_uuids
             promql = ("(max_over_time(DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION"
                       "{UUID=~\"%s\"}[%ds:]) - min_over_time("
                       "DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION{UUID=~\"%s\"}"

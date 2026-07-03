@@ -60,6 +60,27 @@ class TestEnergyKwh(unittest.TestCase):
         self.assertIsNone(er.energy_kwh([], ["GPU-aaa"]))
 
 
+class TestUuidRegex(unittest.TestCase):
+    def test_hyphens_survive_unescaped(self):
+        rx, safe, dropped = er.uuid_regex(
+            ["GPU-ff32a749-638d-95a9-0ba8-539ee8e18388", "GPU-aaa"])
+        self.assertEqual(
+            rx, "GPU-ff32a749-638d-95a9-0ba8-539ee8e18388|GPU-aaa")
+        self.assertNotIn("\\", rx)
+        self.assertEqual(dropped, 0)
+
+    def test_bad_uuid_dropped(self):
+        rx, safe, dropped = er.uuid_regex(['GPU-aaa', 'evil"} or {x=~".*'])
+        self.assertEqual(rx, "GPU-aaa")
+        self.assertEqual(safe, ["GPU-aaa"])
+        self.assertEqual(dropped, 1)
+
+    def test_all_bad_is_none(self):
+        rx, safe, dropped = er.uuid_regex(['x"y'])
+        self.assertIsNone(rx)
+        self.assertEqual(dropped, 1)
+
+
 class TestRollup(unittest.TestCase):
     def jobs(self):
         return [{"jobid": 1, "user": "alice", "elapsed_s": 7200, "gpus": 2,
