@@ -91,6 +91,13 @@ class TestCli(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["partitions"]["kempner_eng"]["fit"]["1"], 7)
 
+    def test_zero_shape_exits_3(self):
+        proc = run_cli("--from-file",
+                       os.path.join(loader.FIXTURES, "scontrol_nodes.txt"),
+                       "--cpus-per-gpu", "0")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("frag_report: error:", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

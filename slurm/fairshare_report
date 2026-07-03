@@ -63,6 +63,7 @@ def parse_sshare(text):
 def rank(accounts, top_n):
     usable = [a for a in accounts
               if a["norm_shares"] and a["norm_shares"] > 0]
+    no_shares = len(accounts) - len(usable)
     with_usage = []
     zero = 0
     for a in usable:
@@ -73,7 +74,7 @@ def rank(accounts, top_n):
         else:
             a["ratio"] = usage / a["norm_shares"]
             with_usage.append(a)
-    return {"usable": len(usable), "zero_usage": zero,
+    return {"usable": len(usable), "zero_usage": zero, "no_shares": no_shares,
             "over": sorted(with_usage, key=lambda a: a["ratio"],
                            reverse=True)[:top_n],
             "under": sorted(with_usage, key=lambda a: a["ratio"])[:top_n]}
@@ -97,8 +98,8 @@ def _table(lines, title, rows):
 
 def render(accounts, skipped, ranked):
     lines = ["fairshare_report: %d top-level accounts (%d with zero usage; "
-             "skipped %d user rows, %d malformed)"
-             % (ranked["usable"], ranked["zero_usage"],
+             "%d without shares; skipped %d user rows, %d malformed)"
+             % (ranked["usable"], ranked["zero_usage"], ranked["no_shares"],
                 skipped["user_rows"], skipped["malformed"])]
     _table(lines, "most over-served (usage >> share)", ranked["over"])
     _table(lines, "most under-served (usage << share)", ranked["under"])

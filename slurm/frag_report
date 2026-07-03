@@ -134,6 +134,9 @@ def main(argv=None):
                         help="replay captured scontrol show node -o output")
     args = parser.parse_args(argv)
 
+    if args.cpus_per_gpu <= 0 or args.mem_per_gpu <= 0:
+        slurmlib.err_exit(TOOL, "--cpus-per-gpu and --mem-per-gpu must be > 0")
+
     if args.from_file:
         text = slurmlib.read_text(args.from_file, TOOL)
     else:

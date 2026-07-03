@@ -62,6 +62,15 @@ class TestRank(unittest.TestCase):
         r = self.ranked()
         self.assertEqual(r["usable"], 4)
 
+    def test_no_shares_counted(self):
+        accounts, _ = fr.parse_sshare(loader.fixture("sshare.txt"))
+        accounts.append({"account": "zed_lab", "raw_shares": None,
+                         "norm_shares": None, "raw_usage": None,
+                         "effectv_usage": None, "fairshare": None})
+        r = fr.rank(accounts, top_n=2)
+        self.assertEqual(r["no_shares"], 1)
+        self.assertEqual(r["usable"], 4)
+
 
 class TestCli(unittest.TestCase):
     def test_report_exit_0(self):
