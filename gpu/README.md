@@ -9,10 +9,21 @@ the jobstats `config` module (`PROM_SERVER`), so these must run where the
 | `jobstats_dcgm` | Per-job, time-averaged DCGM **profiling** metrics that jobstats does *not* store in its blob: SM-active, SM-occupancy, tensor/fp pipe activity, DRAM-active, power, energy. Joins `DCGM_FI_*` to a job's GPUs on UUID. |
 | `jobstats_extended.py` | Subclass of `jobstats.Jobstats` that folds those DCGM metrics back **into** the jobstats blob, keyed per-GPU by `minor_number` like the built-in `gpu_utilization`. |
 | `gpu_health` | Node-local GPU **health** probe: ECC & row-remap, throttling, PCIe/NVLink error counters, with a tiered OK/WARN/FAIL verdict (exit 0/1/2; 3 = probe error). `--json` emits a snapshot; `--from-xml` replays a captured `nvidia-smi -q -x` dump. |
+| `xid_history` | Window report of **XID errors** fleet-wide, each episode mapped to node, GPU, and the job/user that held the GPU (exit 1 when any found). |
+| `energy_report` | Per-user/account **GPU energy (kWh)** over a window, rolled up from DCGM energy counters via the jobstats job→GPU join. |
+| `fleet_util` | % of **allocated** GPU-hours with SM activity below a threshold, by partition — "taken" vs "working" for capacity planning. |
 
 > **Note:** unlike the other tools here, `gpu_health` runs **on the GPU node
 > itself** and talks to `nvidia-smi` directly — no Prometheus, no jobstats
 > modules, Python 3 stdlib only.
+
+> **Note:** `xid_history`, `energy_report`, and `fleet_util` are
+> **window/fleet** tools (vs the per-job profilers above): they query
+> Prometheus over a time range and run wherever `jobstats` is installed —
+> no allocation needed. A retrospective throttle report was considered and
+> dropped: this cluster's dcgm-exporter does not scrape
+> `DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`; if ops enables it (or the newer
+> `DCGM_EXP_CLOCK_EVENTS_COUNT`), that tool becomes buildable.
 
 ### Running `gpu_health` on a GPU node via Slurm
 

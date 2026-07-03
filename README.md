@@ -61,6 +61,9 @@ the `jobstats` command lives.
 |---|---|
 | `jobstats_dcgm` | Per-job, time-averaged DCGM **profiling** metrics that jobstats does *not* store in its blob: SM-active, SM-occupancy, tensor/fp pipe activity, DRAM-active, power, energy. Joins `DCGM_FI_*` to a job's GPUs on UUID. |
 | `jobstats_extended.py` | Subclass of `jobstats.Jobstats` that folds those DCGM metrics back **into** the jobstats blob, keyed per-GPU by `minor_number` like the built-in `gpu_utilization`. Lets you test the extended blob before swapping it in cluster-wide. |
+| `xid_history` | Window report of **XID errors** fleet-wide, each episode mapped to node, GPU, and the job/user that held the GPU (exit 1 when any found). |
+| `energy_report` | Per-user/account **GPU energy (kWh)** over a window, rolled up from DCGM energy counters via the jobstats job→GPU join. |
+| `fleet_util` | % of **allocated** GPU-hours with SM activity below a threshold, by partition — "taken" vs "working" for capacity planning. |
 
 ## fabric/ — InfiniBand / topology diagnostics
 
