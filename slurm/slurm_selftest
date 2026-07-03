@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""slurm_selftest -- canary job verifying the scheduler itself behaves.
+
+Adapted from fasrc/reframe-fasrc checks/system/slurm/slurm.py (BSD),
+re-cast as a standalone verdict CLI.
+
+One small sbatch job runs seconds-long sub-checks, each printing exactly
+one marker line: SELFTEST <name> PASS|FAIL|SKIP <detail>.
+
+  env             sbatch --export propagates a variable into both tasks
+  placement       hostname matches --node-pattern (SKIP without the flag)
+  gpu_grant       nvidia-smi -L sees >=1 GPU (SKIP without --gpu)
+  gres_accounting scontrol show job reports gpu:1 (SKIP without --gpu)
+  oom_enforcement a --mem=512M step allocating ~2GB must be OOM-killed
+
+Usage:
+    slurm_selftest -A ACCOUNT -p PARTITION [--gpu] [--node-pattern REGEX]
+                   [--checks LIST] [--timeout MIN] [--json]
+
+Exit codes: 0 all requested checks PASS/SKIP, 1 any FAIL or NO-RESULT,
+3 submission/timeout/setup error.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurmlib
+
+TOOL = "slurm_selftest"
+ALL_CHECKS = ("env", "placement", "gpu_grant", "gres_accounting",
+              "oom_enforcement")
+ENV_TOKEN = "TEST123456"
+_MARKER_RE = re.compile(r"^SELFTEST (\S+) (PASS|FAIL|SKIP)[ \t]*(.*)$",
+                        re.MULTILINE)
+# ~2GB in 64MB zero-filled chunks; no quotes so it nests in bash cleanly.
+_ALLOCATOR = "a=[bytearray(64*1024*1024) for _ in range(32)]"
+
+
+def job_script(checks, node_pattern, gpu):
+    """Bash canary script: one SELFTEST marker line per requested check."""
+    lines = ["#!/bin/bash", ""]
+    if "env" in checks:
+        lines += [
+            "vals=$(srun -n 2 bash -c 'echo $SELFTEST_VAR')",
+            'n=$(echo "$vals" | grep -c "^%s$")' % ENV_TOKEN,
+            'if [ "$n" -eq 2 ]; then '
+            'echo "SELFTEST env PASS propagated to 2/2 tasks"; '
+            'else echo "SELFTEST env FAIL propagated to $n/2 tasks"; fi',
+        ]
+    if "placement" in checks:
+        if node_pattern:
+            lines += [
+                "host=$(hostname -s)",
+                "if echo \"$host\" | grep -Eq '%s'; then "
+                'echo "SELFTEST placement PASS $host"; '
+                'else echo "SELFTEST placement FAIL $host does not match"; '
+                "fi" % node_pattern,
+            ]
+        else:
+            lines.append(
+                'echo "SELFTEST placement SKIP no --node-pattern given"')
+    if "gpu_grant" in checks:
+        if gpu:
+            lines += [
+                'ngpu=$(nvidia-smi -L 2>/dev/null | grep -c "^GPU ")',
+                'if [ "$ngpu" -ge 1 ]; then '
+                'echo "SELFTEST gpu_grant PASS $ngpu gpu(s) visible"; '
+                'else echo "SELFTEST gpu_grant FAIL no driver-visible gpu"; '
+                "fi",
+            ]
+        else:
+            lines.append('echo "SELFTEST gpu_grant SKIP run with --gpu"')
+    if "gres_accounting" in checks:
+        if gpu:
+            lines += [
+                'tres=$(scontrol show job $SLURM_JOB_ID | '
+                'grep -oE "(TresPerNode|Gres)=[^ ]*")',
+                'if echo "$tres" | grep -q "gpu:1"; then '
+                'echo "SELFTEST gres_accounting PASS $tres"; '
+                'else echo "SELFTEST gres_accounting FAIL $tres"; fi',
+            ]
+        else:
+            lines.append(
+                'echo "SELFTEST gres_accounting SKIP run with --gpu"')
+    if "oom_enforcement" in checks:
+        lines += [
+            'srun -n 1 --mem=512M python3 -c "%s" '
+            "> oom_out.txt 2> oom_err.txt" % _ALLOCATOR,
+            "rc=$?",
+            'if [ "$rc" -ne 0 ] && '
+            'grep -qiE "out of memory|oom.kill|exceeded memory limit" '
+            "oom_err.txt; then "
+            'echo "SELFTEST oom_enforcement PASS step killed (rc=$rc)"; '
+            'elif [ "$rc" -ne 0 ]; then '
+            'echo "SELFTEST oom_enforcement FAIL step died (rc=$rc) '
+            'without an OOM message"; '
+            'else echo "SELFTEST oom_enforcement FAIL allocator survived '
+            'a 512M limit"; fi',
+            "rm -f oom_out.txt oom_err.txt",
+        ]
+    lines.append("exit 0")
+    return "\n".join(lines) + "\n"
+
+
+def parse_markers(text):
+    """Job output -> [{'name','status','detail'}] in appearance order."""
+    return [{"name": m.group(1), "status": m.group(2),
+             "detail": m.group(3).strip()}
+            for m in _MARKER_RE.finditer(text or "")]
+
+
+def evaluate(markers, requested):
+    """Results in `requested` order; NO-RESULT for missing markers."""
+    by_name = {}
+    for marker in markers:
+        by_name.setdefault(marker["name"], marker)
+    results = []
+    for name in requested:
+        if name in by_name:
+            results.append(by_name[name])
+        else:
+            results.append({"name": name, "status": "NO-RESULT",
+                            "detail": "no marker in job output"})
+    return results
+
+
+def render(results):
+    lines = []
+    for r in results:
+        lines.append("  %-16s %-9s %s" % (r["name"], r["status"],
+                                          r["detail"]))
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    lines.append("")
+    lines.append("slurm_selftest: " + "  ".join(
+        "%s=%d" % (s, counts[s]) for s in sorted(counts)))
+    return "\n".join(lines)
+
+
+def _submit_and_wait(script, args, timeout_s):
+    """sbatch the canary via a temp script, poll, return (output, path)."""
+    import tempfile
+    sbatch = ["sbatch", "--parsable", "-J", TOOL, "-A", args.account,
+              "-p", args.partition, "-N", "1", "-n", "2", "--mem=1G",
+              "-t", "5", "-o", "slurm_selftest_%j.out",
+              "--export=ALL,SELFTEST_VAR=" + ENV_TOKEN]
+    if args.gpu:
+        sbatch.append("--gres=gpu:1")
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False)
+    tmp.write(script)
+    tmp.close()
+    try:
+        out = slurmlib.run(sbatch + [tmp.name], timeout=60)
+    finally:
+        os.unlink(tmp.name)
+    jobid = out.strip().split(";")[0]
+    return _wait(jobid, timeout_s)
+
+
+def _wait(jobid, timeout_s):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        queued = slurmlib.run(["squeue", "-h", "-j", jobid], timeout=60)
+        if not queued.strip():
+            break
+        time.sleep(10)
+    else:
+        slurmlib.run(["scancel", jobid], timeout=60)
+        raise RuntimeError("canary job %s did not finish within --timeout"
+                           % jobid)
+    path = "slurm_selftest_%s.out" % jobid
+    try:
+        with open(path) as fh:
+            return fh.read(), path
+    except OSError as exc:
+        raise RuntimeError("cannot read job output %s: %s" % (path, exc))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="scheduler-correctness canary "
+                    "(exit 0 pass, 1 fail, 3 error)")
+    parser.add_argument("-A", "--account")
+    parser.add_argument("-p", "--partition")
+    parser.add_argument("--gpu", action="store_true",
+                        help="request gpu:1 and run the GPU checks")
+    parser.add_argument("--node-pattern", metavar="REGEX",
+                        help="expected hostname pattern for placement")
+    parser.add_argument("--checks", metavar="LIST",
+                        help="comma-separated subset of: %s"
+                             % ",".join(ALL_CHECKS))
+    parser.add_argument("--timeout", type=int, default=10,
+                        help="minutes to wait for the canary (default 10)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the structured result as JSON")
+    parser.add_argument("--from-file", metavar="FILE",
+                        help="parse a captured job output (testing)")
+    args = parser.parse_args(argv)
+
+    requested = list(ALL_CHECKS)
+    if args.checks:
+        requested = [c.strip() for c in args.checks.split(",") if c.strip()]
+        unknown = [c for c in requested if c not in ALL_CHECKS]
+        if unknown:
+            slurmlib.err_exit(TOOL, "unknown check(s): %s"
+                              % ", ".join(unknown))
+
+    if args.from_file:
+        try:
+            with open(args.from_file) as fh:
+                text = fh.read()
+        except OSError as exc:
+            slurmlib.err_exit(TOOL, "cannot read replay file: %s" % exc)
+        out_path = args.from_file
+    else:
+        if not (args.account and args.partition):
+            slurmlib.err_exit(TOOL, "-A ACCOUNT and -p PARTITION are "
+                              "required (or use --from-file)")
+        script = job_script(requested, args.node_pattern, args.gpu)
+        try:
+            text, out_path = _submit_and_wait(script, args,
+                                              args.timeout * 60)
+        except RuntimeError as exc:
+            slurmlib.err_exit(TOOL, str(exc))
+
+    results = evaluate(parse_markers(text), requested)
+    if args.json:
+        print(json.dumps({"results": results, "output": out_path},
+                         indent=2))
+    else:
+        print(render(results))
+        print("job output: %s" % out_path)
+    return 1 if any(r["status"] in ("FAIL", "NO-RESULT")
+                    for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
