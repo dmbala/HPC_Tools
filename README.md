@@ -37,7 +37,7 @@ export PATH="$PWD/slurm:$PWD/gpu:$PWD/fabric:$PATH"
 |---|---|---|
 | `slurm/` | any node with the Slurm client | `sacct` (and `scontrol` for `stotal_kempner`); Python 3 standard library only. **`seff_history`** additionally needs `numpy`, `pandas`, and `termplotlib` — its shebang points at the FASRC `seff-array` env (`/n/sw/envs/seff-array/bin/python3`); repoint it if that env isn't on your cluster. |
 | `gpu/` | wherever `jobstats` is installed | the jobstats `config` / `jobstats` Python modules (auto-discovered on `/usr/local/bin` or `/usr/bin`), the `requests` module (ships with jobstats), and a reachable Prometheus (`PROM_SERVER`, read from the jobstats `config`). |
-| `fabric/` | on the target GPU node (no allocation needed) | host tools `nvidia-smi`, `ibstat`, `ibv_devinfo`, `ibdev2netdev`, plus `python3`. All probes are read-only. |
+| `fabric/` | on the target GPU node (no allocation needed) | host tools `nvidia-smi`, `ibstat`, `ibv_devinfo`, `ibdev2netdev`, plus `python3`. All probes are read-only. The Slurm-based tools (`fleet_snapshot`, `nccl_check`, `ib_bw_pair`) additionally need the Slurm client and a valid account/partition; `ib_bw_pair` needs the `perftest` package on the nodes; `nccl_check` needs an `nccl-tests` build. `topo_verify`/`fleet_snapshot --from-dir` also run offline on saved snapshots. |
 | `analysis/` | anywhere with Python 3 | Python 3 standard library only — runs offline on a `history.jsonl` file. |
 
 ## slurm/ — job accounting & utilization
@@ -73,6 +73,21 @@ No GPU allocation needed; run in seconds. Default outputs land under
 | `ib_snapshot.sh` | Full static topology snapshot for one node (GPUs, NVLink, IB HCAs, ports, `/sys` counters, GPU↔NIC topology matrix) → one JSON file for diffing/forensics. |
 | `affinity_check.sh` | Audits GPU↔IB-NIC PCIe/NUMA affinity from `nvidia-smi topo -m`. Exits non-zero if any GPU lacks a ≥`NODE`-quality link to an IB NIC (`SYS` = 30–50% cross-node BW loss). |
 | `counter_delta.sh` | Diffs two snapshots' per-port IB error counters. Exits non-zero if any error-class counter advanced during a workload window. |
+| `fleet_snapshot` | Runs `ib_snapshot.sh` across a nodelist/partition via per-node Slurm jobs and aggregates: driver/kernel/FW drift, down or degraded links, nonzero error counters, unreached nodes. `--from-dir` re-aggregates a past run offline. Exit 0 clean / 1 anomalies / 3 error. |
+| `topo_verify` | Diffs a node's current snapshot against a blessed golden (`results/golden/<host>.json`, blessed with `--save-golden`). Hardware drift exits 1; driver/kernel changes are informational unless `--strict`. |
+| `nccl_check` | NCCL all-reduce bandwidth smoke test in a fresh Slurm allocation (1–2 nodes). Report-only by default; `--min-busbw` makes it a pass/fail gate; `--counters` brackets the run with `ib_snapshot` + `counter_delta`. Needs an `nccl-tests` build (`--binary` or `$NCCL_TESTS_BIN`). |
+| `ib_bw_pair` | `ib_write_bw`/`ib_read_bw` between two named nodes in one 2-node Slurm job. Passes when BW average ≥ `--min-gbps`, or ≥ 80% of the port's sysfs rate by default. |
+
+Typical expected values (guidance, not code defaults): H100/H200 NVLink
+intra-node all-reduce large-message busbw ≳ 300 GB/s; 2-node NDR (400 Gb/s
+per rail) `ib_write_bw` average ≳ 320 Gb/s (80% of rate). Slurm examples:
+
+```bash
+fabric/fleet_snapshot -A kempner_dev -p kempner_eng
+fabric/topo_verify --save-golden          # on the node, once, post-maintenance
+fabric/nccl_check -A kempner_dev -p kempner_eng -N 2 -G 4 --binary /path/to/all_reduce_perf
+fabric/ib_bw_pair -A kempner_dev -p kempner_eng -w holygpu8a10401,holygpu8a10402
+```
 
 Typical workflow:
 
